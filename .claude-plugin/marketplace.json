@@ -1,0 +1,15 @@
+{
+  "name": "rjw-skills",
+  "owner": {
+    "name": "Robert Wittams",
+    "email": "robert@changedirection.org"
+  },
+  "plugins": [
+    {
+      "name": "rjw-sdlc",
+      "source": "./plugins/rjw-sdlc",
+      "description": "SDLC skills: PR shepherding, issue triage, and related workflow automation.",
+      "version": "1.0.0"
+    }
+  ]
+}

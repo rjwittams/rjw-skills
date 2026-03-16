@@ -1,0 +1,10 @@
+{
+  "name": "rjw-sdlc",
+  "version": "1.0.0",
+  "description": "SDLC skills: PR shepherding, issue triage, and related workflow automation.",
+  "author": {
+    "name": "Robert Wittams"
+  },
+  "license": "MIT",
+  "keywords": ["sdlc", "pr", "issues", "triage", "review", "github"]
+}
