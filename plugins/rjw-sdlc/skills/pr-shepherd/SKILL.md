@@ -12,7 +12,7 @@ Shepherd a pull request from submission to merge readiness. Run after submitting
 
 **Maximize quality through the review interaction.** Every review comment is an opportunity to improve the PR — the goal is to extract maximum value from reviewer feedback, not to converge to merge as fast as possible. Accept and implement feedback that improves the code. Push back only when you have concrete technical evidence that a suggestion is wrong. Never agree performatively, but equally never dismiss feedback to save iterations.
 
-When handling review feedback, invoke the `receiving-code-review` skill. Verify suggestions against the codebase before implementing or pushing back.
+When handling review feedback, treat each comment as a claim to verify, not an instruction to follow: check it against the actual codebase before implementing or pushing back, and skip performative agreement ("You're absolutely right") in replies — respond with what you verified and what you did.
 
 ## PR Detection
 
@@ -127,13 +127,12 @@ If any checks failed, use the `failed_checks` from the status or wait output (wh
 
 If there are unresolved review comments:
 
-1. **Invoke the `receiving-code-review` skill** — this sets the right mindset for handling feedback
-2. Fetch all review content:
+1. Fetch all review content:
    ```bash
    ${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py reviews $PR_NUMBER
    ```
    This returns inline threads, top-level reviews, AND issue comments (which often contain bot review feedback).
-3. For each comment thread, follow the receiving-code-review process:
+2. For each comment thread:
    - **Read** the full comment without reacting
    - **Verify** the suggestion against the codebase
    - **Categorize:**
@@ -155,9 +154,9 @@ If there are unresolved review comments:
 
    **The goal is maximum quality, not minimum iterations.** Every piece of review feedback is an opportunity to improve the PR. The default should be to accept and improve, not to defend and exit. Only push back when you have concrete technical evidence, not when it would be faster to dismiss.
 
-4. Commit all code fixes in a single commit with descriptive message, push
+3. Commit all code fixes in a single commit with descriptive message, push
 
-5. Reply to each comment thread using the helper script:
+4. Reply to each comment thread using the helper script:
    ```bash
    # Auto-detects comment type and picks the correct endpoint
    ${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py reply $PR_NUMBER $COMMENT_ID "Fixed. [Brief description]"
@@ -167,7 +166,7 @@ If there are unresolved review comments:
    ```
    The `reply` subcommand checks whether the comment is an inline review comment (reply-able via thread endpoint) or a top-level comment (falls back to posting a new top-level comment). This avoids the 404 errors from using the wrong endpoint.
 
-6. Present a summary of actions taken on each comment
+5. Present a summary of actions taken on each comment
 
 ## Phase 6: Follow-up Tickets
 
