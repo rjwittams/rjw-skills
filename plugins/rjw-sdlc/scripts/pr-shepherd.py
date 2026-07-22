@@ -755,6 +755,10 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
     pr = args.pr_number
     timeout = args.timeout
     interval = args.interval
+    # Adaptive backoff: stay responsive early, decay toward a cap for long CI
+    # runs — fixed 30s polling across many concurrent shepherds was a main
+    # consumer of the shared 5k/hr GitHub rate limit (flotilla#885).
+    poll_cap = max(interval, 120)
     deadline = time.time() + timeout
     wait_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -804,6 +808,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
             print(f"Waiting... no checks registered yet, {int(remaining)}s remaining",
                   file=sys.stderr)
             time.sleep(min(interval, remaining))
+            interval = min(int(interval * 1.5), poll_cap)
             continue
 
         pending = [c for c in checks if _classify_check(c) == "pending"]
@@ -855,6 +860,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         time.sleep(min(interval, remaining))
+        interval = min(int(interval * 1.5), poll_cap)
 
 
 def cmd_new_reviews(args: argparse.Namespace) -> None:
