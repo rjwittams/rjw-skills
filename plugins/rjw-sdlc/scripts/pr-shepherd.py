@@ -58,6 +58,32 @@ def _is_fresh(path: Path) -> bool:
     return (time.time() - path.stat().st_mtime) < CACHE_TTL
 
 
+def _ci_ema_path() -> Path:
+    try:
+        repo = _get_repo().replace("/", "_")
+    except Exception:
+        repo = (_repo_cache or "default").replace("/", "_")
+    return _cache_path(f"ci_ema_{repo}")
+
+
+def _load_ci_ema() -> float | None:
+    """Expected seconds for this repo's checks to complete, learned from
+    prior waits (EMA). No API cost — each completed wait is an observation."""
+    try:
+        return float(json.loads(_ci_ema_path().read_text())["ema_seconds"])
+    except Exception:
+        return None
+
+
+def _record_ci_duration(seconds: float) -> None:
+    prior = _load_ci_ema()
+    ema = seconds if prior is None else 0.7 * prior + 0.3 * seconds
+    try:
+        _ci_ema_path().write_text(json.dumps({"ema_seconds": round(ema, 1)}))
+    except OSError:
+        pass
+
+
 # ── Data fetching ──────────────────────────────────────────────────────
 
 def _gh_json(args: list[str], cache_name: str) -> dict | list:
@@ -772,6 +798,12 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
 
     poll_count = 0
     meta = {}
+    # Expectation-first polling (flotilla#885): after confirming checks are
+    # pending, sleep to ~90% of the learned expected CI duration before
+    # entering the poll/backoff cadence — aim at the completion time instead
+    # of sampling uniformly.
+    expected = _load_ci_ema()
+    expectation_slept = False
     while True:
         # Checks are the hot datum — fetch fresh every poll. PR metadata
         # (mergeable state) changes rarely mid-wait; refresh it every 3rd
@@ -822,6 +854,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
         if not pending:
             # All checks complete — build detailed result
             check_info = _summarize_checks(checks)
+            _record_ci_duration(time.time() - (deadline - timeout))
             result = {
                 "done": True,
                 "merge_state": merge_state,
@@ -865,6 +898,15 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
             f"{int(remaining)}s remaining",
             file=sys.stderr,
         )
+        if expected is not None and not expectation_slept:
+            expectation_slept = True
+            elapsed = time.time() - (deadline - timeout)
+            head_start = 0.9 * expected - elapsed
+            if head_start > interval:
+                print(f"Expected CI duration ~{int(expected)}s; sleeping {int(head_start)}s toward it",
+                      file=sys.stderr)
+                time.sleep(min(head_start, remaining))
+                continue
         time.sleep(min(interval, remaining))
         interval = min(int(interval * 1.5), poll_cap)
 
