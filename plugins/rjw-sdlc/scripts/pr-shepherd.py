@@ -770,12 +770,18 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
         else:
             exclude_authors = {_get_current_user()}
 
+    poll_count = 0
+    meta = {}
     while True:
-        # Invalidate caches so we get fresh data each poll
+        # Checks are the hot datum — fetch fresh every poll. PR metadata
+        # (mergeable state) changes rarely mid-wait; refresh it every 3rd
+        # poll to halve API traffic (flotilla#885).
         _invalidate_cache(f"pr_{pr}_checks*")
-        _invalidate_cache(f"pr_{pr}_meta*")
         checks = fetch_pr_checks(pr)
-        meta = fetch_pr_metadata(pr)
+        if poll_count % 3 == 0:
+            _invalidate_cache(f"pr_{pr}_meta*")
+            meta = fetch_pr_metadata(pr)
+        poll_count += 1
         merge_state = meta.get("mergeable", "UNKNOWN")
 
         # Conflicts block CI — exit early so the shepherd can resolve them
