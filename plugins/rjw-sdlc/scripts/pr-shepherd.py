@@ -20,6 +20,7 @@ Write subcommands:
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import datetime, timezone
 import json
 import re
@@ -781,6 +782,13 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
     pr = args.pr_number
     timeout = args.timeout
     interval = args.interval
+    # Enforce a pacing floor: callers (often agents) pass aggressive
+    # --interval values that stampede the shared 5k/hr GitHub rate limit
+    # (flotilla#885). The tool owns its pacing; override only via env.
+    if interval < 30 and not os.environ.get("PR_SHEPHERD_FAST"):
+        print(f"Note: --interval {interval}s raised to the 30s floor "
+              "(set PR_SHEPHERD_FAST=1 to override)", file=sys.stderr)
+        interval = 30
     # Adaptive backoff: stay responsive early, decay toward a cap for long CI
     # runs — fixed 30s polling across many concurrent shepherds was a main
     # consumer of the shared 5k/hr GitHub rate limit (flotilla#885).
@@ -900,7 +908,22 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
         )
         if expected is not None and not expectation_slept:
             expectation_slept = True
-            elapsed = time.time() - (deadline - timeout)
+            # Anchor on the CI run's actual start so repeated short-timeout
+            # invocations still converge on the expected completion time.
+            started = [c.get("startedAt") for c in checks if c.get("startedAt")]
+            try:
+                earliest = min(
+                    datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+                    for s in started
+                )
+                elapsed = time.time() - earliest
+            except ValueError:
+                elapsed = time.time() - (deadline - timeout)
+            if timeout < 0.5 * expected:
+                print(f"Note: expected CI duration ~{int(expected)}s for this repo; "
+                      f"--timeout {int(timeout)}s will return before completion — "
+                      "prefer a single wait-for-checks with a larger --timeout over re-invoking",
+                      file=sys.stderr)
             head_start = 0.9 * expected - elapsed
             if head_start > interval:
                 print(f"Expected CI duration ~{int(expected)}s; sleeping {int(head_start)}s toward it",
