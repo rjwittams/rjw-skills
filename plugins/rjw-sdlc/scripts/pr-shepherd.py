@@ -1059,8 +1059,8 @@ def main() -> None:
     p_wait.add_argument("pr_number", type=int, help="PR number")
     p_wait.add_argument("--timeout", type=int, default=900,
                         help="Timeout in seconds (default: 900)")
-    p_wait.add_argument("--interval", type=int, default=30,
-                        help="Poll interval in seconds (default: 30)")
+    # Accepted only so stale caller habits don't crash; ignored and hidden.
+    p_wait.add_argument("--interval", type=int, default=30, help=argparse.SUPPRESS)
     p_wait.add_argument("--check-reviews", action="store_true",
                         help="After checks complete, check for new review comments")
     p_wait.add_argument("--exclude-author", dest="exclude_authors", action="append",
