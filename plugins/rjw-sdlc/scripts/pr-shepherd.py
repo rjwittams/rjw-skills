@@ -785,17 +785,16 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
     # were inventing schedules (--interval 10 --timeout 50, re-invoked in a
     # loop). The tool owns its pacing outright — --interval is ignored, and
     # sub-5-minute timeouts are raised so one call means one real wait.
-    # PR_SHEPHERD_FAST=1 restores manual control for humans who mean it.
+    # There is deliberately no override: a previous env-var escape hatch
+    # (PR_SHEPHERD_FAST) was discovered and used by every agent within a day
+    # of shipping — advisory infrastructure gets bypassed (flotilla#812).
+    # Humans who genuinely need manual pacing can edit this script.
     interval = 30
-    if not os.environ.get("PR_SHEPHERD_FAST"):
-        if args.interval != 30:
-            print("Note: --interval is tool-managed and was ignored", file=sys.stderr)
-        if timeout < 300:
-            print(f"Note: --timeout {int(timeout)}s raised to 300s — one call, one real wait "
-                  "(set PR_SHEPHERD_FAST=1 to override)", file=sys.stderr)
-            timeout = 300
-    else:
-        interval = args.interval
+    if args.interval != 30:
+        print("Note: --interval is tool-managed and was ignored", file=sys.stderr)
+    if timeout < 300:
+        print(f"Note: --timeout {int(timeout)}s raised to 300s — one call, one real wait", file=sys.stderr)
+        timeout = 300
     # Adaptive backoff: stay responsive early, decay toward a cap for long CI
     # runs — fixed 30s polling across many concurrent shepherds was a main
     # consumer of the shared 5k/hr GitHub rate limit (flotilla#885).
