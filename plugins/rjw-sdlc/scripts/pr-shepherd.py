@@ -20,6 +20,7 @@ Write subcommands:
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import datetime, timezone
 import json
 import re
@@ -56,6 +57,32 @@ def _is_fresh(path: Path) -> bool:
     if not path.exists():
         return False
     return (time.time() - path.stat().st_mtime) < CACHE_TTL
+
+
+def _ci_ema_path() -> Path:
+    try:
+        repo = _get_repo().replace("/", "_")
+    except Exception:
+        repo = (_repo_cache or "default").replace("/", "_")
+    return _cache_path(f"ci_ema_{repo}")
+
+
+def _load_ci_ema() -> float | None:
+    """Expected seconds for this repo's checks to complete, learned from
+    prior waits (EMA). No API cost — each completed wait is an observation."""
+    try:
+        return float(json.loads(_ci_ema_path().read_text())["ema_seconds"])
+    except Exception:
+        return None
+
+
+def _record_ci_duration(seconds: float) -> None:
+    prior = _load_ci_ema()
+    ema = seconds if prior is None else 0.7 * prior + 0.3 * seconds
+    try:
+        _ci_ema_path().write_text(json.dumps({"ema_seconds": round(ema, 1)}))
+    except OSError:
+        pass
 
 
 # ── Data fetching ──────────────────────────────────────────────────────
@@ -754,7 +781,24 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
     """
     pr = args.pr_number
     timeout = args.timeout
-    interval = args.interval
+    # Timing is the tool's concern, not the caller's (flotilla#885): agents
+    # were inventing schedules (--interval 10 --timeout 50, re-invoked in a
+    # loop). The tool owns its pacing outright — --interval is ignored, and
+    # sub-5-minute timeouts are raised so one call means one real wait.
+    # There is deliberately no override: a previous env-var escape hatch
+    # (PR_SHEPHERD_FAST) was discovered and used by every agent within a day
+    # of shipping — advisory infrastructure gets bypassed (flotilla#812).
+    # Humans who genuinely need manual pacing can edit this script.
+    interval = 30
+    if args.interval != 30:
+        print("Note: --interval is tool-managed and was ignored", file=sys.stderr)
+    if timeout < 300:
+        print(f"Note: --timeout {int(timeout)}s raised to 300s — one call, one real wait", file=sys.stderr)
+        timeout = 300
+    # Adaptive backoff: stay responsive early, decay toward a cap for long CI
+    # runs — fixed 30s polling across many concurrent shepherds was a main
+    # consumer of the shared 5k/hr GitHub rate limit (flotilla#885).
+    poll_cap = max(interval, 120)
     deadline = time.time() + timeout
     wait_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -766,12 +810,24 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
         else:
             exclude_authors = {_get_current_user()}
 
+    poll_count = 0
+    meta = {}
+    # Expectation-first polling (flotilla#885): after confirming checks are
+    # pending, sleep to ~90% of the learned expected CI duration before
+    # entering the poll/backoff cadence — aim at the completion time instead
+    # of sampling uniformly.
+    expected = _load_ci_ema()
+    expectation_slept = False
     while True:
-        # Invalidate caches so we get fresh data each poll
+        # Checks are the hot datum — fetch fresh every poll. PR metadata
+        # (mergeable state) changes rarely mid-wait; refresh it every 3rd
+        # poll to halve API traffic (flotilla#885).
         _invalidate_cache(f"pr_{pr}_checks*")
-        _invalidate_cache(f"pr_{pr}_meta*")
         checks = fetch_pr_checks(pr)
-        meta = fetch_pr_metadata(pr)
+        if poll_count % 3 == 0:
+            _invalidate_cache(f"pr_{pr}_meta*")
+            meta = fetch_pr_metadata(pr)
+        poll_count += 1
         merge_state = meta.get("mergeable", "UNKNOWN")
 
         # Conflicts block CI — exit early so the shepherd can resolve them
@@ -804,6 +860,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
             print(f"Waiting... no checks registered yet, {int(remaining)}s remaining",
                   file=sys.stderr)
             time.sleep(min(interval, remaining))
+            interval = min(int(interval * 1.5), poll_cap)
             continue
 
         pending = [c for c in checks if _classify_check(c) == "pending"]
@@ -811,6 +868,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
         if not pending:
             # All checks complete — build detailed result
             check_info = _summarize_checks(checks)
+            _record_ci_duration(time.time() - (deadline - timeout))
             result = {
                 "done": True,
                 "merge_state": merge_state,
@@ -854,7 +912,32 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
             f"{int(remaining)}s remaining",
             file=sys.stderr,
         )
+        if expected is not None and not expectation_slept:
+            expectation_slept = True
+            # Anchor on the CI run's actual start so repeated short-timeout
+            # invocations still converge on the expected completion time.
+            started = [c.get("startedAt") for c in checks if c.get("startedAt")]
+            try:
+                earliest = min(
+                    datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+                    for s in started
+                )
+                elapsed = time.time() - earliest
+            except ValueError:
+                elapsed = time.time() - (deadline - timeout)
+            if timeout < 0.5 * expected:
+                print(f"Note: expected CI duration ~{int(expected)}s for this repo; "
+                      f"--timeout {int(timeout)}s will return before completion — "
+                      "prefer a single wait-for-checks with a larger --timeout over re-invoking",
+                      file=sys.stderr)
+            head_start = 0.9 * expected - elapsed
+            if head_start > interval:
+                print(f"Expected CI duration ~{int(expected)}s; sleeping {int(head_start)}s toward it",
+                      file=sys.stderr)
+                time.sleep(min(head_start, remaining))
+                continue
         time.sleep(min(interval, remaining))
+        interval = min(int(interval * 1.5), poll_cap)
 
 
 def cmd_new_reviews(args: argparse.Namespace) -> None:
@@ -976,8 +1059,8 @@ def main() -> None:
     p_wait.add_argument("pr_number", type=int, help="PR number")
     p_wait.add_argument("--timeout", type=int, default=900,
                         help="Timeout in seconds (default: 900)")
-    p_wait.add_argument("--interval", type=int, default=30,
-                        help="Poll interval in seconds (default: 30)")
+    # Accepted only so stale caller habits don't crash; ignored and hidden.
+    p_wait.add_argument("--interval", type=int, default=30, help=argparse.SUPPRESS)
     p_wait.add_argument("--check-reviews", action="store_true",
                         help="After checks complete, check for new review comments")
     p_wait.add_argument("--exclude-author", dest="exclude_authors", action="append",

@@ -8,8 +8,8 @@
     {
       "name": "rjw-sdlc",
       "source": "./plugins/rjw-sdlc",
-      "description": "SDLC skills: PR shepherding, issue triage, and related workflow automation.",
-      "version": "1.1.0"
+      "description": "SDLC skills: PR shepherding, issue triage, consistency review, and related workflow automation.",
+      "version": "1.2.0"
     }
   ]
 }
