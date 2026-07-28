@@ -142,7 +142,7 @@ gh issue create \
   --title "Summary of the suggestion" \
   --label from-review \
   --body-file - <<'EOF'
-From PR #N review by @reviewer: [comment link]
+From PR #N review by <reviewer — cite WITHOUT a leading @, e.g. "claude-review bot"; a literal @-mention in an issue body can trigger automation>: [comment link]
 
 [What should be done and why]
 
