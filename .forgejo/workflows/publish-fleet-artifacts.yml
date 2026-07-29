@@ -17,6 +17,7 @@ jobs:
   bundle:
     name: Versioned skills bundle
     runs-on: feta
+    timeout-minutes: 10
     steps:
       - name: Verify fleet runner
         run: |
