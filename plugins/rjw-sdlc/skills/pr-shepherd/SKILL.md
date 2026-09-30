@@ -160,18 +160,13 @@ Reply to the review comment with the issue link using the stdin form above.
 
 ## 6. Wait and Reassess
 
-After pushing changes, wait for both checks and new reviews. The default timeout is 900 seconds and the default interval is 30 seconds:
+After pushing changes, wait for both checks and new reviews:
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py wait-for-checks "$PR_NUMBER" --check-reviews
 ```
 
-For harnesses that should yield control frequently, use short polls and re-invoke:
-
-```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py wait-for-checks "$PR_NUMBER" \
-  --timeout 50 --interval 10 --check-reviews
-```
+The tool owns its pacing. The default timeout is 900 seconds, and shorter timeouts are raised to 300 so that one call is one real wait. It chooses its own poll interval and ignores `--interval`. Make one call and act on its result. Don't loop on short waits.
 
 The result includes conflicts, failed checks with `run_id`, and `new_reviews.count`. Reassess when checks fail, conflicts appear, or new reviews arrive. A wait timeout means “not finished yet,” not “failed.”
 
