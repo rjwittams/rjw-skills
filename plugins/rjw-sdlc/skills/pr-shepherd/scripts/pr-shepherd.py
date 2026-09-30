@@ -16,6 +16,10 @@ Read subcommands:
 Write subcommands:
     comment <PR> <body|->    Post a top-level comment on the PR
     reply <PR> <id> <body|-> Reply to a review comment (detects type, picks endpoint)
+
+Identity: comments by the PR author and by you are never actionable. Under a
+GitHub App installation token, name yourself with --as <app-slug>[bot] or
+PR_SHEPHERD_AS; such tokens can't look themselves up.
 """
 from __future__ import annotations
 
@@ -28,6 +32,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 # ── Caching ────────────────────────────────────────────────────────────
 
@@ -150,13 +155,46 @@ def _get_repo() -> str:
     return _repo_cache
 
 
+_as_login: str | None = None
+
+
+def _get_as_identity() -> dict | None:
+    """Resolve the --as / PR_SHEPHERD_AS login to its GitHub user, if given.
+
+    An App installation token can't ask GitHub who it is (`/user` 403s), so
+    crews name themselves. Resolving the login to a user id both gives the
+    ownership checks something exact to compare and makes a mistyped login
+    fail here instead of silently matching nobody.
+    """
+    if not _as_login:
+        return None
+    result = subprocess.run(
+        ["gh", "api", f"users/{quote(_as_login)}"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        print(f"Error resolving --as {_as_login}: {result.stderr}", file=sys.stderr)
+        sys.exit(1)
+    return json.loads(result.stdout)
+
+
 _user_cache: str | None = None
 
 
 def _get_current_user() -> str:
-    """Get the current GitHub username (cached after first call)."""
+    """Get the current GitHub username (cached after first call).
+
+    An explicit --as identity wins and skips the `/user` lookup, which
+    App installation tokens aren't permitted to make.
+    """
     global _user_cache
     if _user_cache is not None:
+        return _user_cache
+    as_identity = _get_as_identity()
+    if as_identity:
+        _user_cache = as_identity["login"]
         return _user_cache
     result = subprocess.run(
         ["gh", "api", "user", "--jq", ".login"],
@@ -165,7 +203,12 @@ def _get_current_user() -> str:
         timeout=30,
     )
     if result.returncode != 0:
-        print(f"Error detecting user: {result.stderr}", file=sys.stderr)
+        print(
+            f"Error detecting user: {result.stderr}"
+            "GitHub App installation tokens can't look themselves up; name the "
+            "identity with --as <app-slug>[bot] or PR_SHEPHERD_AS.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     _user_cache = result.stdout.strip()
     return _user_cache
@@ -206,6 +249,19 @@ def fetch_pr_metadata(pr: int) -> dict:
     if _repo_cache:
         cmd.extend(["-R", _repo_cache])
     return _gh_json(cmd, f"pr_{pr}_meta")
+
+
+def fetch_pr_author(pr: int, repo: str) -> dict:
+    """Fetch the PR author as the REST API names it.
+
+    `gh pr view` renders an App author as "app/<slug>", but comments come
+    from the REST API, where the same account is "<slug>[bot]". Taking the
+    author from REST keeps both sides in one vocabulary, and its numeric
+    id is what ownership checks compare.
+    """
+    pull = _gh_api(f"repos/{repo}/pulls/{pr}", f"pr_{pr}_pull")
+    assert isinstance(pull, dict)
+    return pull["user"]
 
 
 def fetch_pr_checks(pr: int) -> list[dict]:
@@ -556,9 +612,20 @@ def cmd_status(args: argparse.Namespace) -> None:
     check_info = _summarize_checks(checks)
     review_summary = _summarize_reviews(reviews)
 
-    # Count unresolved comment threads (heuristic: last commenter is not PR author)
+    # Comments by these user ids are ours, never actionable.
+    own_ids = {fetch_pr_author(pr, repo)["id"]}
+    as_identity = _get_as_identity()
+    if as_identity:
+        own_ids.add(as_identity["id"])
+
+    # Count unresolved comment threads (heuristic: last commenter is not us)
     threads = _group_comment_threads(review_comments)
     pr_author = meta.get("author", {}).get("login", "")
+    own_review_comment_ids = {
+        comment["id"]
+        for comment in review_comments
+        if comment.get("user", {}).get("id") in own_ids
+    }
     addressed_review_comment_ids = _find_addressed_comment_ids(review_comments)
     approving_review_comment_ids = {
         comment["id"]
@@ -569,7 +636,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     for thread in threads:
         last_comment = thread["replies"][-1] if thread["replies"] else thread
         if (
-            last_comment["author"] != pr_author
+            last_comment["id"] not in own_review_comment_ids
             and last_comment["id"] not in addressed_review_comment_ids
             and last_comment["id"] not in approving_review_comment_ids
         ):
@@ -591,7 +658,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     actionable_issue_comments = [
         comment
         for comment in issue_comments
-        if comment.get("user", {}).get("login", "") != pr_author
+        if comment.get("user", {}).get("id") not in own_ids
         and comment["id"] not in addressed_comment_ids
         and comment["id"] not in approving_comment_ids
     ]
@@ -1031,6 +1098,11 @@ def main() -> None:
     )
     parser.add_argument("-R", "--repo", metavar="OWNER/REPO",
                         help="GitHub repository (default: auto-detect from git remote)")
+    parser.add_argument("--as", dest="as_login", metavar="LOGIN",
+                        default=os.environ.get("PR_SHEPHERD_AS") or None,
+                        help="GitHub login to act as, e.g. my-app[bot] "
+                             "(default: $PR_SHEPHERD_AS, else the token's user). "
+                             "Required for GitHub App installation tokens")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # status
@@ -1102,6 +1174,8 @@ def main() -> None:
     if args.repo:
         global _repo_cache
         _repo_cache = args.repo
+    global _as_login
+    _as_login = args.as_login
 
     args.func(args)
 

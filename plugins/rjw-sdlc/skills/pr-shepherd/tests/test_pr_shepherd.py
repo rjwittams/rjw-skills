@@ -47,9 +47,25 @@ class PrShepherdCliTest(unittest.TestCase):
                     print(os.environ.get("FAKE_GH_CHECKS", "[]"))
                 elif args and args[0] == "api" and "-X" in args:
                     print(json.dumps({"html_url": "https://example.test/comment/1"}))
+                elif args[:2] == ["api", "user"]:
+                    if os.environ.get("FAKE_GH_USER_FORBIDDEN"):
+                        print("HTTP 403: Resource not accessible by integration", file=sys.stderr)
+                        sys.exit(1)
+                    print(os.environ.get("FAKE_GH_VIEWER", "author"))
+                elif args and args[0] == "api" and args[1].startswith("users/"):
+                    login = args[1].removeprefix("users/").replace("%5B", "[").replace("%5D", "]")
+                    users = json.loads(os.environ.get("FAKE_GH_USERS", "{}"))
+                    if login not in users:
+                        print("HTTP 404: Not Found", file=sys.stderr)
+                        sys.exit(1)
+                    print(json.dumps(users[login]))
                 elif args and args[0] == "api":
                     endpoint = args[1]
-                    if "/pulls/" in endpoint and endpoint.endswith("/reviews?per_page=100"):
+                    if endpoint.rstrip("0123456789").endswith("/pulls/"):
+                        value = os.environ.get(
+                            "FAKE_GH_PULL", json.dumps({"user": {"login": "author", "id": 1}})
+                        )
+                    elif "/pulls/" in endpoint and endpoint.endswith("/reviews?per_page=100"):
                         value = os.environ.get("FAKE_GH_REVIEWS", "[]")
                     elif "/pulls/" in endpoint and endpoint.endswith("/comments?per_page=100"):
                         value = os.environ.get("FAKE_GH_REVIEW_COMMENTS", "[]")
@@ -255,7 +271,7 @@ class PrShepherdCliTest(unittest.TestCase):
                 },
                 {
                     "id": 9002,
-                    "user": {"login": "author"},
+                    "user": {"login": "author", "id": 1},
                     "body": (
                         "Fixed the race.\n\n"
                         "<!-- pr-shepherd-addresses:9001 -->\n"
@@ -408,7 +424,7 @@ class PrShepherdCliTest(unittest.TestCase):
                 {
                     "id": 9402,
                     "in_reply_to_id": 9401,
-                    "user": {"login": "author"},
+                    "user": {"login": "author", "id": 1},
                     "body": (
                         "Added coverage.\n\n"
                         "<!-- pr-shepherd-addresses:9401 -->\n"
@@ -476,7 +492,7 @@ class PrShepherdCliTest(unittest.TestCase):
                 review_comment,
                 {
                     "id": 9202,
-                    "user": {"login": "author"},
+                    "user": {"login": "author", "id": 1},
                     "body": (
                         "Added coverage.\n\n"
                         "<!-- pr-shepherd-addresses:9201 -->\n"
@@ -490,6 +506,121 @@ class PrShepherdCliTest(unittest.TestCase):
 
         self.assertEqual(after.returncode, 0, after.stderr)
         self.assertEqual(json.loads(after.stdout)["issue_comments"]["actionable"], 0)
+
+
+    def pr_metadata(self, author_login: str) -> str:
+        return json.dumps(
+            {
+                "number": self.pr_number,
+                "title": "Shepherded PR",
+                "body": "",
+                "author": {"login": author_login},
+                "state": "OPEN",
+                "isDraft": False,
+                "baseRefName": "main",
+                "headRefName": "shepherded",
+                "mergeable": "MERGEABLE",
+                "url": "https://example.test/pr/shepherded",
+                "additions": 1,
+                "deletions": 0,
+                "changedFiles": 1,
+            }
+        )
+
+    def test_status_recognises_an_app_authors_own_replies(self) -> None:
+        # gh renders an App author as "app/<slug>"; the REST API, which
+        # authors every comment, calls the same account "<slug>[bot]".
+        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("app/flotilla-crew")
+        self.env["FAKE_GH_PULL"] = json.dumps(
+            {"user": {"login": "flotilla-crew[bot]", "id": 309902803}}
+        )
+        crew = {"login": "flotilla-crew[bot]", "id": 309902803}
+        reviewer = {"login": "reviewer-bot", "id": 77}
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [
+                {"id": 9501, "user": crew, "body": "Shepherding this PR.",
+                 "created_at": "2026-07-18T10:00:00Z"},
+                {"id": 9502, "user": reviewer, "body": "Please add a test.",
+                 "created_at": "2026-07-18T10:01:00Z"},
+            ]
+        )
+        self.env["FAKE_GH_REVIEW_COMMENTS"] = json.dumps(
+            [
+                {"id": 9511, "user": reviewer, "body": "Rename this.",
+                 "created_at": "2026-07-18T10:00:00Z", "path": "a.py", "line": 3},
+                {"id": 9512, "in_reply_to_id": 9511, "user": crew,
+                 "body": "Won't rename: it matches the domain term.",
+                 "created_at": "2026-07-18T10:05:00Z"},
+            ]
+        )
+
+        result = self.run_cli("status", str(self.pr_number), "--brief")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(result.stdout)
+        self.assertEqual(status["issue_comments"]["actionable"], 1)
+        self.assertEqual(status["reviews"]["unresolved_threads"], 0)
+
+
+    def crew_shepherding_a_human_pr(self) -> None:
+        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        self.env["FAKE_GH_USERS"] = json.dumps(
+            {"flotilla-crew[bot]": {"login": "flotilla-crew[bot]", "id": 309902803}}
+        )
+        self.env["FAKE_GH_USER_FORBIDDEN"] = "1"
+        crew = {"login": "flotilla-crew[bot]", "id": 309902803}
+        reviewer = {"login": "reviewer-bot", "id": 77}
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [
+                {"id": 9601, "user": reviewer, "body": "Please add a test.",
+                 "created_at": "2026-07-18T10:00:00Z"},
+                {"id": 9602, "user": crew, "body": "Shepherding this PR.",
+                 "created_at": "2026-07-18T10:01:00Z"},
+            ]
+        )
+
+    def test_status_treats_the_as_identity_as_our_own(self) -> None:
+        self.crew_shepherding_a_human_pr()
+
+        result = self.run_cli(
+            "--as", "flotilla-crew[bot]", "status", str(self.pr_number), "--brief"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["issue_comments"]["actionable"], 1)
+
+
+    def test_new_reviews_excludes_the_env_identity_without_asking_who_we_are(self) -> None:
+        self.crew_shepherding_a_human_pr()
+        self.env["PR_SHEPHERD_AS"] = "flotilla-crew[bot]"
+
+        result = self.run_cli("new-reviews", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        new = json.loads(result.stdout)["new_comments"]
+        self.assertEqual([c["author"] for c in new], ["reviewer-bot"])
+        self.assertNotIn(["api", "user", "--jq", ".login"], self.gh_calls())
+
+
+    def test_wait_for_checks_explains_how_to_name_an_app_identity(self) -> None:
+        self.crew_shepherding_a_human_pr()
+
+        result = self.run_cli("wait-for-checks", str(self.pr_number), "--check-reviews")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--as", result.stderr)
+        self.assertIn("PR_SHEPHERD_AS", result.stderr)
+
+
+    def test_an_unknown_as_login_fails_instead_of_matching_nobody(self) -> None:
+        self.crew_shepherding_a_human_pr()
+
+        result = self.run_cli(
+            "--as", "flotila-crew[bot]", "status", str(self.pr_number), "--brief"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--as flotila-crew[bot]", result.stderr)
 
 
 if __name__ == "__main__":
