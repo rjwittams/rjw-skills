@@ -8,13 +8,16 @@ import sys
 import tempfile
 import textwrap
 import time
+from typing import ClassVar
 import unittest
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "pr-shepherd.py"
 
 
-class PrShepherdCliTest(unittest.TestCase):
+class CliHarness(unittest.TestCase):
+    """Runs the helper against a fake `gh` on PATH."""
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -36,7 +39,13 @@ class PrShepherdCliTest(unittest.TestCase):
                 with Path(os.environ["FAKE_GH_LOG"]).open("a") as log:
                     log.write(json.dumps(args) + "\\n")
 
-                if args[:2] == ["repo", "view"]:
+                if args[:2] == ["api", "graphql"]:
+                    print(os.environ.get(
+                        "FAKE_GH_REVIEW_THREADS",
+                        json.dumps({"data": {"repository": {"pullRequest": {
+                            "reviewThreads": {"nodes": []}}}}}),
+                    ))
+                elif args[:2] == ["repo", "view"]:
                     print("owner/repo")
                 elif args[:2] == ["pr", "view"]:
                     if args[2:] == ["--json", "number", "--jq", ".number"]:
@@ -84,6 +93,9 @@ class PrShepherdCliTest(unittest.TestCase):
         self.env = os.environ.copy()
         self.env["PATH"] = f"{self.root}{os.pathsep}{self.env['PATH']}"
         self.env["FAKE_GH_LOG"] = str(self.gh_log)
+        # Tests run inside flotilla crews too; standalone is the default here.
+        self.env.pop("FLOTILLA_CREW_ID", None)
+        self.env.pop("PR_SHEPHERD_AS", None)
 
     def run_cli(
         self, *args: str, input_text: str | None = None
@@ -100,6 +112,27 @@ class PrShepherdCliTest(unittest.TestCase):
     def gh_calls(self) -> list[list[str]]:
         return [json.loads(line) for line in self.gh_log.read_text().splitlines()]
 
+    def pr_metadata(self, author_login: str) -> str:
+        return json.dumps(
+            {
+                "number": self.pr_number,
+                "title": "Shepherded PR",
+                "body": "",
+                "author": {"login": author_login},
+                "state": "OPEN",
+                "isDraft": False,
+                "baseRefName": "main",
+                "headRefName": "shepherded",
+                "mergeable": "MERGEABLE",
+                "url": "https://example.test/pr/shepherded",
+                "additions": 1,
+                "deletions": 0,
+                "changedFiles": 1,
+            }
+        )
+
+
+class PrShepherdCliTest(CliHarness):
     def test_comment_reads_body_from_stdin_without_changing_markdown(self) -> None:
         body = "Fixed `CheckoutReconciler`.\n\n- Preserved $literal syntax.\n"
 
@@ -126,7 +159,7 @@ class PrShepherdCliTest(unittest.TestCase):
         body = "Fixed the reported race.\n"
 
         result = self.run_cli(
-            "reply", str(self.pr_number), "9001", "-", input_text=body
+            "reply", str(self.pr_number), "9001", "--all-handled", "-", input_text=body
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -211,8 +244,11 @@ class PrShepherdCliTest(unittest.TestCase):
                     "changes_requested": 0,
                     "pending": 0,
                     "unresolved_threads": 0,
+                    "actionable_bodies": 0,
                 },
                 "issue_comments": {"actionable": 0},
+                "partially_answered": [],
+                "mode": "wait",
                 "needs_attention": True,
                 "action_items": ["1 checks still pending"],
             },
@@ -484,7 +520,8 @@ class PrShepherdCliTest(unittest.TestCase):
         self.assertEqual(json.loads(before.stdout)["issue_comments"]["actionable"], 1)
 
         reply = self.run_cli(
-            "reply", str(self.pr_number), "9201", "-", input_text="Added coverage."
+            "reply", str(self.pr_number), "9201", "--all-handled", "-",
+            input_text="Added coverage."
         )
         self.assertEqual(reply.returncode, 0, reply.stderr)
         self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
@@ -508,24 +545,6 @@ class PrShepherdCliTest(unittest.TestCase):
         self.assertEqual(json.loads(after.stdout)["issue_comments"]["actionable"], 0)
 
 
-    def pr_metadata(self, author_login: str) -> str:
-        return json.dumps(
-            {
-                "number": self.pr_number,
-                "title": "Shepherded PR",
-                "body": "",
-                "author": {"login": author_login},
-                "state": "OPEN",
-                "isDraft": False,
-                "baseRefName": "main",
-                "headRefName": "shepherded",
-                "mergeable": "MERGEABLE",
-                "url": "https://example.test/pr/shepherded",
-                "additions": 1,
-                "deletions": 0,
-                "changedFiles": 1,
-            }
-        )
 
     def test_status_recognises_an_app_authors_own_replies(self) -> None:
         # gh renders an App author as "app/<slug>"; the REST API, which
@@ -549,7 +568,8 @@ class PrShepherdCliTest(unittest.TestCase):
                 {"id": 9511, "user": reviewer, "body": "Rename this.",
                  "created_at": "2026-07-18T10:00:00Z", "path": "a.py", "line": 3},
                 {"id": 9512, "in_reply_to_id": 9511, "user": crew,
-                 "body": "Won't rename: it matches the domain term.",
+                 "body": "Won't rename: it matches the domain term.\n\n"
+                         "<!-- pr-shepherd-addresses:9511 -->\n",
                  "created_at": "2026-07-18T10:05:00Z"},
             ]
         )
@@ -621,6 +641,317 @@ class PrShepherdCliTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--as flotila-crew[bot]", result.stderr)
+
+
+class PerFindingTest(CliHarness):
+    """Review feedback is tracked per finding; only --all-handled clears a
+    comment (rjw-skills#9)."""
+
+    REVIEWER: ClassVar[dict] = {"login": "reviewer", "id": 77}
+    AUTHOR: ClassVar[dict] = {"login": "author", "id": 1}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+
+    def three_finding_review(self, *replies: dict) -> None:
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [
+                {
+                    "id": 9701,
+                    "user": self.REVIEWER,
+                    "body": (
+                        "No blocking issues.\n\n"
+                        "1. The retry loop never backs off.\n"
+                        "2. `parse` swallows the error.\n\n"
+                        "Nits:\n- rename `tmp`"
+                    ),
+                    "created_at": "2026-07-18T10:00:00Z",
+                },
+                *replies,
+            ]
+        )
+
+    def own_reply(self, comment_id: int, body: str) -> dict:
+        return {
+            "id": comment_id,
+            "user": self.AUTHOR,
+            "body": body,
+            "created_at": "2026-07-18T10:05:00Z",
+        }
+
+    def test_reply_to_one_finding_records_it_without_clearing_the_comment(self) -> None:
+        result = self.run_cli(
+            "reply", str(self.pr_number), "9701", "--finding", "nit-1", "-",
+            input_text="Renamed `tmp` to `pending`.",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        post = self.gh_calls()[-1]
+        body = next(arg for arg in post if arg.startswith("body="))
+        self.assertIn("<!-- pr-shepherd-finding:9701:nit-1 -->", body)
+        self.assertNotIn("pr-shepherd-addresses", body)
+
+    def test_reply_can_answer_findings_and_settle_the_comment_at_once(self) -> None:
+        result = self.run_cli(
+            "reply", str(self.pr_number), "9701",
+            "--finding", "1", "--finding", "2", "--all-handled", "-",
+            input_text="Both fixed.",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = next(arg for arg in self.gh_calls()[-1] if arg.startswith("body="))
+        self.assertTrue(body.endswith(
+            "<!-- pr-shepherd-finding:9701:1 -->\n"
+            "<!-- pr-shepherd-finding:9701:2 -->\n"
+            "<!-- pr-shepherd-addresses:9701 -->\n"
+        ))
+
+    def test_reply_must_say_what_it_settles(self) -> None:
+        result = self.run_cli(
+            "reply", str(self.pr_number), "9701", "-", input_text="Fixed."
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--all-handled", result.stderr)
+        self.assertFalse(self.gh_log.exists() and any(
+            "-X" in call for call in self.gh_calls()
+        ))
+
+    def test_reply_rejects_a_label_that_could_break_the_marker(self) -> None:
+        result = self.run_cli(
+            "reply", str(self.pr_number), "9701", "--finding", "1 -->", "-",
+            input_text="Fixed.",
+        )
+
+        self.assertEqual(result.returncode, 2)
+
+    def test_a_partly_answered_comment_stays_actionable(self) -> None:
+        # The flotilla#2323 failure: one nit fixed, two findings unanswered.
+        self.three_finding_review(
+            self.own_reply(9702, "Renamed.\n\n<!-- pr-shepherd-finding:9701:nit-1 -->\n")
+        )
+
+        result = self.run_cli("status", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(result.stdout)
+        self.assertEqual(status["issue_comments"]["actionable"], 1)
+        self.assertEqual(status["partially_answered"], {"9701": ["nit-1"]})
+        self.assertTrue(status["needs_attention"])
+        self.assertIn(
+            "finish 1 partly answered comments (9701): answer every remaining "
+            "finding, then reply --all-handled",
+            status["action_items"],
+        )
+
+    def test_only_the_all_handled_marker_clears_the_comment(self) -> None:
+        self.three_finding_review(
+            self.own_reply(9702, "Renamed.\n\n<!-- pr-shepherd-finding:9701:nit-1 -->\n"),
+            self.own_reply(
+                9703,
+                "1: backoff added. 2: now re-raised. Both tested.\n\n"
+                "<!-- pr-shepherd-finding:9701:1 -->\n"
+                "<!-- pr-shepherd-finding:9701:2 -->\n"
+                "<!-- pr-shepherd-addresses:9701 -->\n",
+            ),
+        )
+
+        result = self.run_cli("status", str(self.pr_number), "--brief")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(result.stdout)
+        self.assertEqual(status["issue_comments"]["actionable"], 0)
+        self.assertEqual(status["partially_answered"], [])
+        self.assertFalse(status["needs_attention"])
+
+    def test_reviews_comment_lists_the_findings_already_answered(self) -> None:
+        self.three_finding_review(
+            self.own_reply(9702, "Renamed.\n\n<!-- pr-shepherd-finding:9701:nit-1 -->\n")
+        )
+
+        result = self.run_cli("reviews", str(self.pr_number), "--comment", "9701")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        item = json.loads(result.stdout)
+        self.assertEqual(item["answered_findings"], ["nit-1"])
+        self.assertNotIn("fully_addressed", item)
+
+    def test_an_unmarked_own_reply_does_not_settle_a_thread(self) -> None:
+        self.env["FAKE_GH_REVIEW_COMMENTS"] = json.dumps(
+            [
+                {"id": 9801, "user": self.REVIEWER, "body": "Rename this.",
+                 "created_at": "2026-07-18T10:00:00Z", "path": "a.py", "line": 3},
+                {"id": 9802, "in_reply_to_id": 9801, "user": self.AUTHOR,
+                 "body": "Will do.", "created_at": "2026-07-18T10:05:00Z"},
+            ]
+        )
+
+        result = self.run_cli("status", str(self.pr_number), "--brief")
+
+        self.assertEqual(json.loads(result.stdout)["reviews"]["unresolved_threads"], 1)
+
+    def test_a_repeated_finding_reopens_an_addressed_thread(self) -> None:
+        self.env["FAKE_GH_REVIEW_COMMENTS"] = json.dumps(
+            [
+                {"id": 9811, "user": self.REVIEWER, "body": "This leaks the fd.",
+                 "created_at": "2026-07-18T10:00:00Z", "path": "a.py", "line": 3},
+                {"id": 9812, "in_reply_to_id": 9811, "user": self.AUTHOR,
+                 "body": "It's closed by the caller.\n\n<!-- pr-shepherd-addresses:9811 -->\n",
+                 "created_at": "2026-07-18T10:05:00Z"},
+                {"id": 9813, "in_reply_to_id": 9811, "user": self.REVIEWER,
+                 "body": "The error path still leaks the fd.",
+                 "created_at": "2026-07-18T10:10:00Z"},
+            ]
+        )
+
+        result = self.run_cli("status", str(self.pr_number), "--brief")
+
+        self.assertEqual(json.loads(result.stdout)["reviews"]["unresolved_threads"], 1)
+
+    def test_a_resolved_thread_is_skipped(self) -> None:
+        self.env["FAKE_GH_REVIEW_COMMENTS"] = json.dumps(
+            [
+                {"id": 9821, "user": self.REVIEWER, "body": "Rename this.",
+                 "created_at": "2026-07-18T10:00:00Z", "path": "a.py", "line": 3},
+                {"id": 9822, "user": self.REVIEWER, "body": "Add a test.",
+                 "created_at": "2026-07-18T10:00:00Z", "path": "b.py", "line": 9},
+            ]
+        )
+        self.env["FAKE_GH_REVIEW_THREADS"] = json.dumps(
+            {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+                {"isResolved": True, "comments": {"nodes": [{"databaseId": 9821}]}},
+                {"isResolved": False, "comments": {"nodes": [{"databaseId": 9822}]}},
+            ]}}}}}
+        )
+
+        result = self.run_cli("status", str(self.pr_number), "--brief")
+
+        self.assertEqual(json.loads(result.stdout)["reviews"]["unresolved_threads"], 1)
+
+
+class ActionableRuleTest(CliHarness):
+    """Whose feedback counts, aligned with flotilla's crew wake-up rule."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+
+    def review(self, review_id: int, login: str, state: str, body: str, at: str,
+               user_type: str = "User") -> dict:
+        return {
+            "id": review_id,
+            "user": {"login": login, "id": review_id, "type": user_type},
+            "state": state,
+            "body": body,
+            "submitted_at": f"2026-07-18T{at}Z",
+        }
+
+    def test_only_each_reviewers_latest_substantive_review_counts(self) -> None:
+        self.env["FAKE_GH_REVIEWS"] = json.dumps(
+            [
+                # Superseded by the same reviewer's later review.
+                self.review(1, "alice", "CHANGES_REQUESTED", "Fix the race.", "10:00:00"),
+                self.review(2, "alice", "COMMENTED", "Still missing a test.", "10:05:00"),
+                # An empty COMMENTED review (a thread reply) doesn't supersede.
+                self.review(3, "alice", "COMMENTED", "", "10:10:00"),
+                # Empty approvals are ignored outright.
+                self.review(4, "bob", "APPROVED", "", "10:00:00"),
+            ]
+        )
+
+        result = self.run_cli("status", str(self.pr_number))
+
+        status = json.loads(result.stdout)
+        self.assertEqual(status["reviews"]["actionable_review_ids"], [2])
+        self.assertIn("address 1 review bodies from reviewers", status["action_items"])
+
+    def test_an_addressed_review_body_is_cleared(self) -> None:
+        self.env["FAKE_GH_REVIEWS"] = json.dumps(
+            [self.review(2, "alice", "COMMENTED", "Still missing a test.", "10:05:00")]
+        )
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [{"id": 9901, "user": {"login": "author", "id": 1},
+              "body": "Added.\n\n<!-- pr-shepherd-addresses:2 -->\n",
+              "created_at": "2026-07-18T10:06:00Z"}]
+        )
+
+        result = self.run_cli("status", str(self.pr_number), "--brief")
+
+        self.assertEqual(json.loads(result.stdout)["reviews"]["actionable_bodies"], 0)
+
+    def test_review_bots_count_and_other_bots_are_ignored(self) -> None:
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [
+                {"id": 9911, "user": {"login": "claude[bot]", "id": 5, "type": "Bot"},
+                 "body": "1. Missing test.", "created_at": "2026-07-18T10:00:00Z"},
+                {"id": 9912, "user": {"login": "codecov[bot]", "id": 6, "type": "Bot"},
+                 "body": "Coverage dropped 0.1%.", "created_at": "2026-07-18T10:00:00Z"},
+                {"id": 9913, "user": {"login": "house-reviewer[bot]", "id": 7, "type": "Bot"},
+                 "body": "1. Wrong lock order.", "created_at": "2026-07-18T10:00:00Z"},
+            ]
+        )
+
+        default = json.loads(self.run_cli("status", str(self.pr_number)).stdout)
+        configured = json.loads(self.run_cli(
+            "--review-bot", "house-reviewer[bot]", "status", str(self.pr_number)
+        ).stdout)
+
+        self.assertEqual(default["issue_comments"]["actionable"], 1)
+        self.assertEqual(
+            default["ignored_bot_authors"], ["codecov[bot]", "house-reviewer[bot]"]
+        )
+        self.assertEqual(configured["issue_comments"]["actionable"], 2)
+        self.assertEqual(configured["ignored_bot_authors"], ["codecov[bot]"])
+
+
+class NoWaitTest(CliHarness):
+    """Under flotilla (FLOTILLA_CREW_ID set) the helper does one pass and
+    yields instead of polling."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        self.env["FAKE_GH_CHECKS"] = json.dumps(
+            [
+                {"name": "test", "bucket": "pass", "link": ""},
+                {"name": "review", "bucket": "pending", "link": ""},
+            ]
+        )
+
+    def assert_one_snapshot(self, result: subprocess.CompletedProcess[str]) -> None:
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = json.loads(result.stdout)
+        self.assertTrue(snapshot["no_wait"])
+        self.assertFalse(snapshot["done"])
+        self.assertEqual(snapshot["pending_names"], ["review"])
+        self.assertEqual(snapshot["passed"], 1)
+        checks_calls = [c for c in self.gh_calls() if c[:2] == ["pr", "checks"]]
+        self.assertEqual(len(checks_calls), 1)
+
+    def test_wait_for_checks_returns_one_snapshot_under_flotilla(self) -> None:
+        self.env["FLOTILLA_CREW_ID"] = "crew-123"
+
+        result = self.run_cli(
+            "wait-for-checks", str(self.pr_number), "--check-reviews"
+        )
+
+        self.assert_one_snapshot(result)
+
+    def test_no_wait_flag_forces_one_snapshot_standalone(self) -> None:
+        result = self.run_cli("--no-wait", "wait-for-checks", str(self.pr_number))
+
+        self.assert_one_snapshot(result)
+
+    def test_status_reports_the_mode(self) -> None:
+        standalone = json.loads(
+            self.run_cli("status", str(self.pr_number), "--brief").stdout
+        )
+        self.env["FLOTILLA_CREW_ID"] = "crew-123"
+        crew = json.loads(self.run_cli("status", str(self.pr_number), "--brief").stdout)
+
+        self.assertEqual(standalone["mode"], "wait")
+        self.assertEqual(crew["mode"], "no-wait")
 
 
 if __name__ == "__main__":
