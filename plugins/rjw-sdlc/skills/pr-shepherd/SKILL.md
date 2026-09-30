@@ -24,6 +24,12 @@ EOF
 
 The helper records addressed comment IDs in the posted replies. Its `status` command uses those durable markers and excludes unambiguously approving bot reviews from `action_items`.
 
+**Name yourself when running as a GitHub App.** The helper treats comments by the PR author and by you as your own, never as feedback to act on. With a user token it asks GitHub who you are. An App installation token can't, so set `PR_SHEPHERD_AS` to the App's bot login (`<app-slug>[bot]`) or pass `--as` before the subcommand:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py --as "my-app[bot]" status "$PR_NUMBER" --brief
+```
+
 ## Convergence Loop
 
 Run at most five iterations:
