@@ -27,7 +27,7 @@ The helper records addressed comment IDs in the posted replies. Its `status` com
 **Name yourself when running as a GitHub App.** The helper treats comments by the PR author and by you as your own, never as feedback to act on. With a user token it asks GitHub who you are. An App installation token can't, so set `PR_SHEPHERD_AS` to the App's bot login (`<app-slug>[bot]`) or pass `--as` before the subcommand:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py --as "my-app[bot]" status "$PR_NUMBER" --brief
+scripts/pr-shepherd.py --as "my-app[bot]" status "$PR_NUMBER" --brief
 ```
 
 ## Convergence Loop
@@ -162,18 +162,13 @@ Reply to the review comment with the issue link using the stdin form above.
 
 ## 6. Wait and Reassess
 
-After pushing changes, wait for both checks and new reviews. The default timeout is 900 seconds and the default interval is 30 seconds:
+After pushing changes, wait for both checks and new reviews:
 
 ```bash
 scripts/pr-shepherd.py wait-for-checks "$PR_NUMBER" --check-reviews
 ```
 
-For harnesses that should yield control frequently, use short polls and re-invoke:
-
-```bash
-scripts/pr-shepherd.py wait-for-checks "$PR_NUMBER" \
-  --timeout 50 --interval 10 --check-reviews
-```
+The tool owns its pacing. The default timeout is 900 seconds, and shorter timeouts are raised to 300 so that one call is one real wait. It chooses its own poll interval and ignores `--interval`. Make one call and act on its result. Don't loop on short waits.
 
 The result includes conflicts, failed checks with `run_id`, and `new_reviews.count`. Reassess when checks fail, conflicts appear, or new reviews arrive. A wait timeout means “not finished yet,” not “failed.”
 
