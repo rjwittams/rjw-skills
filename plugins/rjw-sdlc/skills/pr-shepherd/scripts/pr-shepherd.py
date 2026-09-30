@@ -15,11 +15,22 @@ Read subcommands:
 
 Write subcommands:
     comment <PR> <body|->    Post a top-level comment on the PR
-    reply <PR> <id> <body|-> Reply to a review comment (detects type, picks endpoint)
+    reply <PR> <id> <body|-> Reply to a review comment (detects type, picks endpoint);
+                             needs --finding LABEL (repeatable) and/or --all-handled
 
 Identity: comments by the PR author and by you are never actionable. Under a
 GitHub App installation token, name yourself with --as <app-slug>[bot] or
 PR_SHEPHERD_AS; such tokens can't look themselves up.
+
+Findings: a comment stays in action items until a reply marks it
+--all-handled. --finding replies record progress without clearing it.
+
+Reviewers: humans and review bots (built-in list plus --review-bot LOGIN).
+Other bots are ignored, as are empty APPROVED/COMMENTED reviews, superseded
+reviews, and resolved threads.
+
+No-wait mode: with --no-wait, or when FLOTILLA_CREW_ID is set, wait-for-checks
+returns one snapshot instead of polling; the caller replies and yields.
 """
 from __future__ import annotations
 
@@ -38,7 +49,33 @@ from urllib.parse import quote
 
 CACHE_DIR = Path("/tmp/pr_shepherd_cache")
 CACHE_TTL = 120  # 2 minutes — PR state changes faster than issue state
+# Marker semantics (rjw-skills#9). A review comment often carries several
+# findings, and the helper can't split them reliably, so it never decides
+# for itself that a comment is settled:
+#   pr-shepherd-finding:<id>:<label>  one finding in comment <id> answered;
+#                                     the comment stays actionable.
+#   pr-shepherd-addresses:<id>        every finding in comment <id> handled;
+#                                     only this clears the comment. `reply`
+#                                     writes it only under --all-handled.
+# flotilla (flotilla-org/flotilla#2300) reads the addresses marker to decide
+# whether a crew still owes a review reply, so its form must stay stable.
 ADDRESS_MARKER_RE = re.compile(r"<!--\s*pr-shepherd-addresses:(\d+)\s*-->")
+FINDING_MARKER_RE = re.compile(r"<!--\s*pr-shepherd-finding:(\d+):([A-Za-z0-9._-]+)\s*-->")
+FINDING_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# Bots whose comments are review feedback. Every other bot (CI reporters,
+# coverage, dependency bots) is ignored; add more with --review-bot.
+DEFAULT_REVIEW_BOTS = frozenset({
+    "claude[bot]",
+    "copilot-pull-request-reviewer[bot]",
+    "coderabbitai[bot]",
+    "chatgpt-codex-connector[bot]",
+    "gemini-code-assist[bot]",
+    "cursor[bot]",
+    "greptile-apps[bot]",
+})
+# Running as a flotilla crew: flotilla wakes the crew when checks finish or
+# review feedback lands, so the helper does one pass and yields.
+NO_WAIT_ENV = "FLOTILLA_CREW_ID"
 NO_FINDINGS_RE = re.compile(
     r"\b(?:"
     r"no (?:(?:further|new|outstanding) )?(?:issues|findings)(?: (?:were )?found)?"
@@ -322,6 +359,64 @@ def fetch_pr_issue_comments(pr: int, repo: str) -> list[dict]:
     )
 
 
+RESOLVED_THREADS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes { isResolved comments(first: 1) { nodes { databaseId } } }
+      }
+    }
+  }
+}
+"""
+
+
+def fetch_resolved_thread_root_ids(pr: int, repo: str) -> set[int]:
+    """Return the root comment ids of review threads GitHub marks resolved.
+
+    Resolution is only visible through GraphQL. If the query fails, treat
+    every thread as unresolved: over-reporting a thread is safe, silently
+    dropping one isn't.
+    """
+    cached = _cache_path(f"pr_{pr}_resolved_threads")
+    if _is_fresh(cached):
+        return set(json.loads(cached.read_text()))
+    owner, _, name = repo.partition("/")
+    result = subprocess.run(
+        [
+            "gh", "api", "graphql",
+            "-f", f"query={RESOLVED_THREADS_QUERY}",
+            "-F", f"owner={owner}",
+            "-F", f"name={name}",
+            "-F", f"number={pr}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    try:
+        if result.returncode != 0:
+            raise ValueError(result.stderr.strip())
+        threads = json.loads(result.stdout)["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+        resolved = {
+            comments[0]["databaseId"]
+            for thread in threads
+            if thread.get("isResolved")
+            and (comments := thread.get("comments", {}).get("nodes"))
+        }
+    except (ValueError, KeyError, TypeError) as error:
+        print(
+            f"Warning: could not read thread resolution ({error}); "
+            "treating all threads as unresolved",
+            file=sys.stderr,
+        )
+        return set()
+    cached.write_text(json.dumps(sorted(resolved)))
+    return resolved
+
+
 # ── Write operations ───────────────────────────────────────────────────
 
 def _gh_api_post(endpoint: str, fields: dict[str, str]) -> dict:
@@ -363,9 +458,15 @@ def _read_body(body: str | None, body_file: Path | None) -> str:
     return body
 
 
-def _with_address_marker(body: str, comment_id: int) -> str:
-    """Record which GitHub comment this reply addresses in hidden metadata."""
-    return f"{body.rstrip()}\n\n<!-- pr-shepherd-addresses:{comment_id} -->\n"
+def _with_reply_markers(
+    body: str, comment_id: int, findings: list[str], all_handled: bool
+) -> str:
+    """Record, in hidden metadata, which findings of which comment this
+    reply answers, and whether it settles the whole comment."""
+    markers = [f"<!-- pr-shepherd-finding:{comment_id}:{label} -->" for label in findings]
+    if all_handled:
+        markers.append(f"<!-- pr-shepherd-addresses:{comment_id} -->")
+    return f"{body.rstrip()}\n\n" + "\n".join(markers) + "\n"
 
 
 def _is_inline_review_comment(comment_id: int, pr: int, repo: str) -> bool:
@@ -472,12 +573,120 @@ def _find_issue_refs(text: str) -> list[int]:
 
 
 def _find_addressed_comment_ids(comments: list[dict]) -> set[int]:
-    """Read durable addressed-comment markers from GitHub comment bodies."""
+    """Read the fully-addressed markers from GitHub comment bodies."""
     return {
         int(match)
         for comment in comments
-        for match in ADDRESS_MARKER_RE.findall(comment.get("body", ""))
+        for match in ADDRESS_MARKER_RE.findall(comment.get("body") or "")
     }
+
+
+def _find_answered_findings(comments: list[dict]) -> dict[int, list[str]]:
+    """Map comment id -> labels of findings answered so far, in reply order."""
+    answered: dict[int, list[str]] = {}
+    for comment in comments:
+        for comment_id, label in FINDING_MARKER_RE.findall(comment.get("body") or ""):
+            labels = answered.setdefault(int(comment_id), [])
+            if label not in labels:
+                labels.append(label)
+    return answered
+
+
+def _is_bot(user: dict) -> bool:
+    return user.get("type") == "Bot" or user.get("login", "").endswith("[bot]")
+
+
+class Feedback:
+    """Decides whose comments are review feedback and which are settled.
+
+    The "actionable" rule matches flotilla's crew wake-up rule:
+    - our own comments (PR author, --as identity) are never feedback;
+    - humans and configured review bots are reviewers; other bots are ignored;
+    - only a reviewer's latest review counts, and empty APPROVED/COMMENTED
+      reviews (thread replies create those) are ignored;
+    - resolved threads are skipped;
+    - a comment stays actionable until a fully-addressed marker names it or
+      it is an unambiguous no-findings approval.
+    """
+
+    def __init__(
+        self,
+        own_ids: set[int],
+        review_bots: set[str],
+        marker_sources: list[dict],
+    ) -> None:
+        self.own_ids = own_ids
+        self.review_bots = review_bots
+        self.addressed = _find_addressed_comment_ids(marker_sources)
+        self.answered = _find_answered_findings(marker_sources)
+        self.ignored_bots: set[str] = set()
+
+    def is_reviewer(self, user: dict) -> bool:
+        if user.get("id") in self.own_ids:
+            return False
+        if _is_bot(user) and user.get("login", "") not in self.review_bots:
+            self.ignored_bots.add(user.get("login", ""))
+            return False
+        return True
+
+    def is_open(self, comment: dict) -> bool:
+        """A reviewer's comment that is neither fully addressed nor approving."""
+        return (
+            self.is_reviewer(comment.get("user") or {})
+            and comment["id"] not in self.addressed
+            and not _is_approving_comment(comment)
+        )
+
+    def partially_answered(self, comment_ids: list[int]) -> list[int]:
+        return sorted(i for i in comment_ids if i in self.answered)
+
+    def latest_reviews(self, reviews: list[dict]) -> list[dict]:
+        """Each reviewer's latest review that carries feedback or a verdict."""
+        latest: dict[str, dict] = {}
+        for review in reviews:
+            state = review.get("state", "")
+            body = (review.get("body") or "").strip()
+            if state in ("PENDING", "DISMISSED"):
+                continue
+            if state in ("APPROVED", "COMMENTED") and not body:
+                continue
+            if not self.is_reviewer(review.get("user") or {}):
+                continue
+            login = review["user"]["login"]
+            key = (review.get("submitted_at") or "", review.get("id") or 0)
+            if login not in latest or key >= latest[login]["_key"]:
+                latest[login] = {**review, "_key": key}
+        return [{k: v for k, v in r.items() if k != "_key"} for r in latest.values()]
+
+    def open_threads(
+        self, review_comments: list[dict], resolved_roots: set[int]
+    ) -> tuple[list[dict], list[int]]:
+        """Unresolved threads with a reviewer comment still open, plus the
+        ids of those open comments.
+
+        Every reviewer comment in the thread counts, not only the last: a
+        reviewer who repeats a finding after our reply has not been settled.
+        """
+        by_id = {comment["id"]: comment for comment in review_comments}
+        open_threads = []
+        open_ids = []
+        for thread in _group_comment_threads(review_comments):
+            if thread["id"] in resolved_roots:
+                continue
+            ids = [thread["id"], *(reply["id"] for reply in thread["replies"])]
+            still_open = [i for i in ids if self.is_open(by_id[i])]
+            if still_open:
+                open_threads.append(thread)
+                open_ids.extend(still_open)
+        return open_threads, open_ids
+
+
+def _parse_review_bots(extra: list[str] | None) -> set[str]:
+    return set(DEFAULT_REVIEW_BOTS) | set(extra or [])
+
+
+def _no_wait(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "no_wait", False) or os.environ.get(NO_WAIT_ENV))
 
 
 def _is_approving_comment(comment: dict) -> bool:
@@ -618,29 +827,28 @@ def cmd_status(args: argparse.Namespace) -> None:
     if as_identity:
         own_ids.add(as_identity["id"])
 
-    # Count unresolved comment threads (heuristic: last commenter is not us)
-    threads = _group_comment_threads(review_comments)
     pr_author = meta.get("author", {}).get("login", "")
-    own_review_comment_ids = {
-        comment["id"]
-        for comment in review_comments
-        if comment.get("user", {}).get("id") in own_ids
-    }
+    # Replies land on whichever surface they answer (a reply to a review
+    # body is an issue comment), so read markers from both.
+    feedback = Feedback(
+        own_ids,
+        _parse_review_bots(args.review_bots),
+        issue_comments + review_comments,
+    )
+
+    unresolved, open_review_comment_ids = feedback.open_threads(
+        review_comments, fetch_resolved_thread_root_ids(pr, repo)
+    )
     addressed_review_comment_ids = _find_addressed_comment_ids(review_comments)
     approving_review_comment_ids = {
         comment["id"]
         for comment in review_comments
         if _is_approving_comment(comment)
     }
-    unresolved = []
-    for thread in threads:
-        last_comment = thread["replies"][-1] if thread["replies"] else thread
-        if (
-            last_comment["id"] not in own_review_comment_ids
-            and last_comment["id"] not in addressed_review_comment_ids
-            and last_comment["id"] not in approving_review_comment_ids
-        ):
-            unresolved.append(thread)
+
+    actionable_reviews = [
+        review for review in feedback.latest_reviews(reviews) if feedback.is_open(review)
+    ]
 
     body_refs = _find_issue_refs(meta.get("body", ""))
 
@@ -656,12 +864,14 @@ def cmd_status(args: argparse.Namespace) -> None:
         if _is_approving_comment(comment)
     }
     actionable_issue_comments = [
-        comment
-        for comment in issue_comments
-        if comment.get("user", {}).get("id") not in own_ids
-        and comment["id"] not in addressed_comment_ids
-        and comment["id"] not in approving_comment_ids
+        comment for comment in issue_comments if feedback.is_open(comment)
     ]
+    open_ids = (
+        open_review_comment_ids
+        + [review["id"] for review in actionable_reviews]
+        + [comment["id"] for comment in actionable_issue_comments]
+    )
+    partially_answered = feedback.partially_answered(open_ids)
 
     merge_state = meta.get("mergeable", "UNKNOWN")
 
@@ -676,9 +886,18 @@ def cmd_status(args: argparse.Namespace) -> None:
         action_items.append(f"{check_info['counts']['pending']} checks still pending")
     if len(unresolved) > 0:
         action_items.append(f"address {len(unresolved)} unresolved review threads")
+    if actionable_reviews:
+        action_items.append(f"address {len(actionable_reviews)} review bodies from reviewers")
     reviewer_issue_comments = len(actionable_issue_comments)
     if reviewer_issue_comments > 0:
         action_items.append(f"evaluate {reviewer_issue_comments} issue comments from reviewers/bots")
+    if partially_answered:
+        ids = ", ".join(str(i) for i in partially_answered)
+        action_items.append(
+            f"finish {len(partially_answered)} partly answered comments ({ids}): "
+            "answer every remaining finding, then reply --all-handled"
+        )
+    mode = "no-wait" if _no_wait(args) else "wait"
 
     result = {
         "pr": {
@@ -701,6 +920,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             "has_approvals": any(r["latest_state"] == "APPROVED" for r in review_summary),
             "has_changes_requested": any(r["latest_state"] == "CHANGES_REQUESTED" for r in review_summary),
             "unresolved_threads": len(unresolved),
+            "actionable_review_ids": sorted(review["id"] for review in actionable_reviews),
             "addressed_comment_ids": sorted(addressed_review_comment_ids),
             "approving_comment_ids": sorted(approving_review_comment_ids),
         },
@@ -711,7 +931,12 @@ def cmd_status(args: argparse.Namespace) -> None:
             "addressed_ids": sorted(addressed_comment_ids),
             "approving_ids": sorted(approving_comment_ids),
         },
+        "partially_answered": {
+            str(i): feedback.answered[i] for i in partially_answered
+        },
+        "ignored_bot_authors": sorted(feedback.ignored_bots),
         "linked_issues": body_refs,
+        "mode": mode,
         "needs_attention": len(action_items) > 0,
         "action_items": action_items,
     }
@@ -726,6 +951,7 @@ def cmd_status(args: argparse.Namespace) -> None:
                 r["latest_state"] in ("PENDING", "COMMENTED") for r in review_summary
             ),
             "unresolved_threads": len(unresolved),
+            "actionable_bodies": len(actionable_reviews),
         }
         result = {
             "pr": {
@@ -737,6 +963,8 @@ def cmd_status(args: argparse.Namespace) -> None:
             "checks": check_info["counts"],
             "reviews": review_counts,
             "issue_comments": {"actionable": reviewer_issue_comments},
+            "partially_answered": sorted(partially_answered),
+            "mode": mode,
             "needs_attention": len(action_items) > 0,
             "action_items": action_items,
         }
@@ -764,6 +992,12 @@ def cmd_reviews(args: argparse.Namespace) -> None:
         if result is None:
             print(f"Error: review comment {args.comment_id} not found", file=sys.stderr)
             sys.exit(1)
+        markers = issue_comments + review_comments
+        answered = _find_answered_findings(markers).get(args.comment_id, [])
+        if answered:
+            result["answered_findings"] = answered
+        if args.comment_id in _find_addressed_comment_ids(markers):
+            result["fully_addressed"] = True
         json.dump(result, sys.stdout, indent=2)
         print()
         return
@@ -839,6 +1073,40 @@ def cmd_checks(args: argparse.Namespace) -> None:
     print()
 
 
+def _check_snapshot(pr: int) -> None:
+    """No-wait mode: report the checks once and tell the caller to yield.
+
+    Under flotilla the crew is woken when checks finish or review feedback
+    arrives, so polling here only holds the crew's turn open and spends the
+    shared GitHub rate limit.
+    """
+    _invalidate_cache(f"pr_{pr}_checks*")
+    _invalidate_cache(f"pr_{pr}_meta*")
+    checks = fetch_pr_checks(pr)
+    merge_state = fetch_pr_metadata(pr).get("mergeable", "UNKNOWN")
+    check_info = _summarize_checks(checks)
+    pending = [c.get("name", "") for c in checks if _classify_check(c) == "pending"]
+    result = {
+        "done": bool(checks) and not pending,
+        "no_wait": True,
+        "conflicting": merge_state == "CONFLICTING",
+        "merge_state": merge_state,
+        "total": len(checks),
+        "passed": check_info["counts"]["pass"],
+        "failed": check_info["counts"]["fail"],
+        "still_pending": len(pending),
+        "pending_names": pending,
+        "failed_checks": check_info["failed"],
+        "message": (
+            f"no-wait mode ({NO_WAIT_ENV} set or --no-wait): one snapshot, no polling. "
+            "Act on failures or conflicts, reply to every finding, then yield; "
+            "flotilla wakes the crew when checks finish or feedback arrives."
+        ),
+    }
+    json.dump(result, sys.stdout, indent=2)
+    print()
+
+
 def cmd_wait_for_checks(args: argparse.Namespace) -> None:
     """Poll until all checks complete or timeout is reached.
 
@@ -847,6 +1115,9 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
     Includes failed check details (with run_id) so a separate `checks` call is unnecessary.
     """
     pr = args.pr_number
+    if _no_wait(args):
+        _check_snapshot(pr)
+        return
     timeout = args.timeout
     # Timing is the tool's concern, not the caller's (flotilla#885): agents
     # were inventing schedules (--interval 10 --timeout 50, re-invoked in a
@@ -1063,9 +1334,27 @@ def cmd_reply(args: argparse.Namespace) -> None:
     """
     pr = args.pr_number
     comment_id = args.comment_id
-    body = _with_address_marker(
+    findings = args.findings or []
+    if not findings and not args.all_handled:
+        print(
+            "Error: say what this reply settles: --finding LABEL for each finding "
+            "it answers, and/or --all-handled once every finding in the comment "
+            "is fixed, answered, or deferred to an issue",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    bad = [label for label in findings if not FINDING_LABEL_RE.match(label)]
+    if bad:
+        print(
+            f"Error: finding labels may use only letters, digits, '.', '_' and '-': {bad}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    body = _with_reply_markers(
         _read_body(args.body, args.body_file),
         comment_id,
+        findings,
+        args.all_handled,
     )
     repo = _get_repo()
 
@@ -1103,6 +1392,12 @@ def main() -> None:
                         help="GitHub login to act as, e.g. my-app[bot] "
                              "(default: $PR_SHEPHERD_AS, else the token's user). "
                              "Required for GitHub App installation tokens")
+    parser.add_argument("--no-wait", action="store_true",
+                        help=f"One pass, no polling: wait-for-checks returns a single "
+                             f"snapshot (default when ${NO_WAIT_ENV} is set)")
+    parser.add_argument("--review-bot", dest="review_bots", action="append", metavar="LOGIN",
+                        help="Treat this bot's comments as review feedback (repeatable; "
+                             "added to the built-in review bots). Other bots are ignored")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # status
@@ -1166,6 +1461,12 @@ def main() -> None:
     reply_body = p_reply.add_mutually_exclusive_group(required=True)
     reply_body.add_argument("body", nargs="?", help="Reply body text, or - for stdin")
     reply_body.add_argument("--body-file", type=Path, help="Read reply body from file")
+    p_reply.add_argument("--finding", dest="findings", action="append", metavar="LABEL",
+                         help="Label of a finding this reply answers, e.g. 1, 2, nit-3 "
+                              "(repeatable). Leaves the comment actionable")
+    p_reply.add_argument("--all-handled", action="store_true",
+                         help="Every finding in the comment is now fixed, answered, or "
+                              "deferred to an issue; clears it from action items")
     p_reply.set_defaults(func=cmd_reply)
 
     args = parser.parse_args()
