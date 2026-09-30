@@ -11,7 +11,7 @@ import time
 import unittest
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "pr-shepherd.py"
+SCRIPT = Path(__file__).parents[1] / "skills" / "pr-shepherd" / "scripts" / "pr-shepherd.py"
 
 
 class PrShepherdCliTest(unittest.TestCase):

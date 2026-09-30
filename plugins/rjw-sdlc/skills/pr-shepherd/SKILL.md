@@ -8,6 +8,8 @@ argument-hint: "[PR-number]"
 
 Shepherd a pull request from submission to merge readiness. Re-run it as the PR moves through review cycles.
 
+The helper is `scripts/pr-shepherd.py` in this skill's directory, the directory that holds this `SKILL.md`. In the commands below, replace `<skill-dir>` with that directory's absolute path. The helper needs only Python 3.11 and an authenticated `gh`.
+
 ## Directives
 
 **Maximize quality through the review interaction.** Treat each comment as a claim to verify against the codebase, not an instruction to follow. Accept feedback that improves the code. Push back only with concrete technical evidence. Do not agree performatively or dismiss feedback to save an iteration.
@@ -15,7 +17,7 @@ Shepherd a pull request from submission to merge readiness. Re-run it as the PR 
 **Send all helper-script comment bodies through stdin.** Never put review prose in a shell argument: backticked identifiers can be executed by the shell and silently removed from the posted comment. Use a quoted heredoc:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py reply "$PR_NUMBER" "$COMMENT_ID" - <<'EOF'
+python3 <skill-dir>/scripts/pr-shepherd.py reply "$PR_NUMBER" "$COMMENT_ID" - <<'EOF'
 Fixed `CheckoutReconciler` by preserving the existing state transition.
 EOF
 ```
@@ -25,7 +27,7 @@ The helper records addressed comment IDs in the posted replies. Its `status` com
 **Name yourself when running as a GitHub App.** The helper treats comments by the PR author and by you as your own, never as feedback to act on. With a user token it asks GitHub who you are. An App installation token can't, so set `PR_SHEPHERD_AS` to the App's bot login (`<app-slug>[bot]`) or pass `--as` before the subcommand:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py --as "my-app[bot]" status "$PR_NUMBER" --brief
+python3 <skill-dir>/scripts/pr-shepherd.py --as "my-app[bot]" status "$PR_NUMBER" --brief
 ```
 
 ## Convergence Loop
@@ -45,13 +47,13 @@ The loop exits when `needs_attention` is false, no code changes were needed, or 
 If a PR number was supplied, use it:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py status "$ARGUMENTS" --brief
+python3 <skill-dir>/scripts/pr-shepherd.py status "$ARGUMENTS" --brief
 ```
 
 Otherwise let `status` detect the PR associated with the current branch; it reports a clear error if none exists:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py status --brief
+python3 <skill-dir>/scripts/pr-shepherd.py status --brief
 ```
 
 Read `pr.number` from the result and use it as `PR_NUMBER` for subsequent commands. The brief result contains the merge state, check/review counts, `needs_attention`, and the authoritative `action_items` list. Use the full `status` response only when its additional metadata is useful.
@@ -89,20 +91,20 @@ gh run view <run_id> --log-failed
 - Lint/typecheck failure: fix the code.
 - Infrastructure failure such as a timeout, rate limit, or known flake: report it and recommend `gh run rerun <run-id>`.
 
-Use `${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py checks "$PR_NUMBER"` only when the status/wait details are insufficient. Commit and push code fixes, and distinguish them from failures needing manual intervention.
+Use `python3 <skill-dir>/scripts/pr-shepherd.py checks "$PR_NUMBER"` only when the status/wait details are insufficient. Commit and push code fixes, and distinguish them from failures needing manual intervention.
 
 ## 4. Process Reviews
 
 Fetch all inline threads, top-level reviews, and issue comments:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py reviews "$PR_NUMBER"
+python3 <skill-dir>/scripts/pr-shepherd.py reviews "$PR_NUMBER"
 ```
 
 When an aggregate entry is truncated or you need to focus on one finding, fetch its complete body directly:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py reviews "$PR_NUMBER" --comment "$COMMENT_ID"
+python3 <skill-dir>/scripts/pr-shepherd.py reviews "$PR_NUMBER" --comment "$COMMENT_ID"
 ```
 
 For each actionable comment:
@@ -120,7 +122,7 @@ For each actionable comment:
 Commit related review fixes together and push. Then reply to every handled comment through stdin:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py reply "$PR_NUMBER" "$COMMENT_ID" - <<'EOF'
+python3 <skill-dir>/scripts/pr-shepherd.py reply "$PR_NUMBER" "$COMMENT_ID" - <<'EOF'
 Fixed. The state transition now preserves the existing invariant, with a regression test covering the reported case.
 EOF
 ```
@@ -128,7 +130,7 @@ EOF
 For a top-level comment that is not a response to a specific review comment:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py comment "$PR_NUMBER" - <<'EOF'
+python3 <skill-dir>/scripts/pr-shepherd.py comment "$PR_NUMBER" - <<'EOF'
 Review-cycle summary goes here.
 EOF
 ```
@@ -163,7 +165,7 @@ Reply to the review comment with the issue link using the stdin form above.
 After pushing changes, wait for both checks and new reviews:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/pr-shepherd.py wait-for-checks "$PR_NUMBER" --check-reviews
+python3 <skill-dir>/scripts/pr-shepherd.py wait-for-checks "$PR_NUMBER" --check-reviews
 ```
 
 The tool owns its pacing. The default timeout is 900 seconds, and shorter timeouts are raised to 300 so that one call is one real wait. It chooses its own poll interval and ignores `--interval`. Make one call and act on its result. Don't loop on short waits.
