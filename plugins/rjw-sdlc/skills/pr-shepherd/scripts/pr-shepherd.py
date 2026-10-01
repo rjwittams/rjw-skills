@@ -17,6 +17,16 @@ Write subcommands:
     comment <PR> <body|->    Post a top-level comment on the PR
     reply <PR> <id> <body|-> Reply to a review comment (detects type, picks endpoint);
                              needs --finding LABEL (repeatable) and/or --all-handled
+    ack <PR> [--comment-ids] Acknowledge pickup: add the `shepherd: addressing`
+                             label and 👀-react to the named review items
+    clear <PR>               Remove the `shepherd: addressing` label on converge
+
+Pickup signal: while a crew works a review offline (fix, test, push, reply can
+take an hour), the PR looks untouched. `ack` makes the work visible on GitHub —
+a `shepherd: addressing` label meaning "unanswered points remain; not
+merge-ready", plus an eyes reaction on each comment it is handling (a review
+body has no reactions endpoint, so the label covers it). `clear` removes the
+label once the iteration converges; a stalled or blocked crew leaves it set.
 
 Identity: comments by the PR author and by you are never actionable. Under a
 GitHub App installation token, name yourself with --as <app-slug>[bot] or
@@ -76,6 +86,16 @@ DEFAULT_REVIEW_BOTS = frozenset({
 # Running as a flotilla crew: flotilla wakes the crew when checks finish or
 # review feedback lands, so the helper does one pass and yields.
 NO_WAIT_ENV = "FLOTILLA_CREW_ID"
+# Pickup signal (rjw-skills#11). `ack` marks a PR as being worked on so the
+# owner, who merges from GitHub, can tell "a crew is on it" from "ignored"
+# during the long offline fix/test/push window. The label means the PR still
+# has unanswered review points and is not merge-ready; `clear` removes it when
+# the iteration converges, a stalled crew leaves it set.
+ADDRESSING_LABEL = "shepherd: addressing"
+ADDRESSING_LABEL_DESCRIPTION = "A crew is processing review feedback; not merge-ready"
+ADDRESSING_LABEL_COLOR = "fbca04"
+# The reaction `ack` leaves on each item it picks up (GitHub reaction content).
+PICKUP_REACTION = "eyes"
 NO_FINDINGS_RE = re.compile(
     r"\b(?:"
     r"no (?:(?:further|new|outstanding) )?(?:issues|findings)(?: (?:were )?found)?"
@@ -419,21 +439,124 @@ def fetch_resolved_thread_root_ids(pr: int, repo: str) -> set[int]:
 
 # ── Write operations ───────────────────────────────────────────────────
 
-def _gh_api_post(endpoint: str, fields: dict[str, str]) -> dict:
-    """POST to a gh api endpoint with field data. Returns parsed JSON response."""
-    cmd = ["gh", "api", endpoint, "-X", "POST"]
-    for key, value in fields.items():
+def _gh_api_request(
+    endpoint: str,
+    method: str,
+    fields: dict[str, str] | None = None,
+    tolerate: tuple[str, ...] = (),
+) -> dict | list | None:
+    """Call a gh api endpoint with an explicit method and field data.
+
+    Returns the parsed JSON response, or None when the call fails with an HTTP
+    status named in `tolerate` (e.g. "404" for a DELETE of something absent).
+    """
+    cmd = ["gh", "api", endpoint, "-X", method]
+    for key, value in (fields or {}).items():
         cmd.extend(["-f", f"{key}={value}"])
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if result.returncode != 0:
-        print(f"Error: gh api POST {endpoint}: {result.stderr.strip()}", file=sys.stderr)
+        if any(status in result.stderr for status in tolerate):
+            return None
+        print(f"Error: gh api {method} {endpoint}: {result.stderr.strip()}", file=sys.stderr)
         sys.exit(1)
 
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError:
         return {"raw": result.stdout.strip()}
+
+
+def _gh_api_post(endpoint: str, fields: dict[str, str]) -> dict:
+    """POST to a gh api endpoint with field data. Returns parsed JSON response."""
+    result = _gh_api_request(endpoint, "POST", fields)
+    assert isinstance(result, dict)
+    return result
+
+
+def _gh_api_get_live(endpoint: str) -> dict | list | None:
+    """GET a gh api endpoint without caching, returning None on any failure.
+
+    Used for state that must be read fresh and where "couldn't read it" is a
+    safe answer — a reaction listing, a label-existence probe."""
+    result = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True, timeout=60)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def _reactions_endpoint(repo: str, item: dict) -> str | None:
+    """The reactions endpoint for a review item, chosen by its surface.
+
+    Issue comments and inline review comments each have a reactions endpoint.
+    A submitted review's *body* has none — GitHub's Reactions API covers issue
+    comments and pull-request review comments, not reviews — so this returns
+    None for a review body, and the caller labels it without a reaction.
+    """
+    kind = item["type"]
+    item_id = item["id"]
+    if kind == "issue_comment":
+        return f"repos/{repo}/issues/comments/{item_id}/reactions"
+    if kind == "review_comment":
+        return f"repos/{repo}/pulls/comments/{item_id}/reactions"
+    return None
+
+
+def _has_own_pickup_reaction(endpoint: str, me: str) -> bool:
+    """True if this account already left the pickup reaction on the item."""
+    reactions = _gh_api_get_live(f"{endpoint}?per_page=100")
+    if not isinstance(reactions, list):
+        return False
+    return any(
+        r.get("content") == PICKUP_REACTION and (r.get("user") or {}).get("login") == me
+        for r in reactions
+    )
+
+
+def _ensure_addressing_label(repo: str) -> None:
+    """Create the addressing label if the repo doesn't define it yet."""
+    if _gh_api_get_live(f"repos/{repo}/labels/{quote(ADDRESSING_LABEL)}") is not None:
+        return
+    _gh_api_request(
+        f"repos/{repo}/labels",
+        "POST",
+        {
+            "name": ADDRESSING_LABEL,
+            "description": ADDRESSING_LABEL_DESCRIPTION,
+            "color": ADDRESSING_LABEL_COLOR,
+        },
+        tolerate=("422",),  # already created, e.g. by a concurrent shepherd
+    )
+
+
+def _add_addressing_label(repo: str, pr: int) -> None:
+    """Add the addressing label to the PR (a no-op if already present)."""
+    _gh_api_request(
+        f"repos/{repo}/issues/{pr}/labels",
+        "POST",
+        {"labels[]": ADDRESSING_LABEL},
+    )
+
+
+def _remove_addressing_label(repo: str, pr: int) -> bool:
+    """Remove the addressing label; return whether it had been set."""
+    removed = _gh_api_request(
+        f"repos/{repo}/issues/{pr}/labels/{quote(ADDRESSING_LABEL)}",
+        "DELETE",
+        tolerate=("404",),  # the label isn't on the PR — nothing to clear
+    )
+    return removed is not None
+
+
+def _addressing_label_set(meta: dict) -> bool:
+    """Whether the PR carries the addressing label, per its metadata."""
+    return any(
+        (label.get("name") if isinstance(label, dict) else label) == ADDRESSING_LABEL
+        for label in meta.get("labels") or []
+    )
 
 
 def _invalidate_cache(pattern: str) -> None:
@@ -935,6 +1058,7 @@ def cmd_status(args: argparse.Namespace) -> None:
             str(i): feedback.answered[i] for i in partially_answered
         },
         "ignored_bot_authors": sorted(feedback.ignored_bots),
+        "addressing_label": _addressing_label_set(meta),
         "linked_issues": body_refs,
         "mode": mode,
         "needs_attention": len(action_items) > 0,
@@ -1378,6 +1502,78 @@ def cmd_reply(args: argparse.Namespace) -> None:
         print(json.dumps({"ok": True, "type": "top_level_fallback", "url": comment_url}))
 
 
+def cmd_ack(args: argparse.Namespace) -> None:
+    """Acknowledge pickup: label the PR and react to the items being handled.
+
+    The label marks the PR not-merge-ready while a crew works; the reaction
+    shows which items it is addressing. Both are idempotent: adding a present
+    label is a no-op, and a reaction this account already left is skipped.
+    """
+    pr = _resolve_pr_number(args.pr_number)
+    repo = _get_repo()
+
+    _ensure_addressing_label(repo)
+    _add_addressing_label(repo, pr)
+    _invalidate_cache(f"pr_{pr}_meta*")
+
+    reacted: list[int] = []
+    already_reacted: list[int] = []
+    unreactable: list[int] = []
+    not_found: list[int] = []
+    if args.comment_ids:
+        reviews = fetch_pr_reviews(pr, repo)
+        review_comments = fetch_pr_review_comments(pr, repo)
+        issue_comments = fetch_pr_issue_comments(pr, repo)
+        me = _get_current_user()
+        for comment_id in args.comment_ids:
+            item = _find_review_item(comment_id, reviews, review_comments, issue_comments)
+            if item is None:
+                not_found.append(comment_id)
+                print(f"Warning: review item {comment_id} not found on PR #{pr}; skipping",
+                      file=sys.stderr)
+                continue
+            endpoint = _reactions_endpoint(repo, item)
+            if endpoint is None:
+                # A review body has no reactions endpoint; the label covers it.
+                unreactable.append(comment_id)
+                print(f"Note: review item {comment_id} is a {item['type']}, which has no "
+                      "reactions endpoint; covered by the label only", file=sys.stderr)
+                continue
+            if _has_own_pickup_reaction(endpoint, me):
+                already_reacted.append(comment_id)
+                continue
+            _gh_api_request(endpoint, "POST", {"content": PICKUP_REACTION})
+            reacted.append(comment_id)
+
+    print(json.dumps({
+        "ok": True,
+        "label": ADDRESSING_LABEL,
+        "label_set": True,
+        "reacted": reacted,
+        "already_reacted": already_reacted,
+        "unreactable": unreactable,
+        "not_found": not_found,
+    }))
+
+
+def cmd_clear(args: argparse.Namespace) -> None:
+    """Clear the addressing label once the iteration has converged.
+
+    A no-op when the label isn't set. Call it only when every finding is
+    answered: a stalled or blocked crew should leave the label on so the PR
+    stays visibly not-merge-ready.
+    """
+    pr = _resolve_pr_number(args.pr_number)
+    repo = _get_repo()
+    removed = _remove_addressing_label(repo, pr)
+    _invalidate_cache(f"pr_{pr}_meta*")
+    print(json.dumps({
+        "ok": True,
+        "label": ADDRESSING_LABEL,
+        "removed": removed,
+    }))
+
+
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1468,6 +1664,23 @@ def main() -> None:
                          help="Every finding in the comment is now fixed, answered, or "
                               "deferred to an issue; clears it from action items")
     p_reply.set_defaults(func=cmd_reply)
+
+    # ack (write)
+    p_ack = sub.add_parser("ack",
+                           help="Acknowledge pickup: label the PR and react to items being handled")
+    p_ack.add_argument("pr_number", type=int, nargs="?",
+                       help="PR number (default: current branch PR)")
+    p_ack.add_argument("--comment-ids", dest="comment_ids", type=int, nargs="+", metavar="ID",
+                       help="Review item ids to react to: issue comments, review bodies, "
+                            "or inline review comments (the ids reported by status/reviews)")
+    p_ack.set_defaults(func=cmd_ack)
+
+    # clear (write)
+    p_clear = sub.add_parser("clear",
+                             help="Remove the addressing label once the iteration converges")
+    p_clear.add_argument("pr_number", type=int, nargs="?",
+                         help="PR number (default: current branch PR)")
+    p_clear.set_defaults(func=cmd_clear)
 
     args = parser.parse_args()
 
