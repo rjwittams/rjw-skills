@@ -43,14 +43,34 @@ scripts/pr-shepherd.py --as "my-app[bot]" status "$PR_NUMBER" --brief
 
 Each iteration:
 
-1. Fetch `status --brief` and follow its `action_items`.
+1. Fetch `status --brief` and follow its `action_items`. If it has any actionable review feedback, `ack` the pickup before you start working (section 1.1): a crew's fix/test/push cycle can run for an hour, and until then the PR looks untouched to the owner, who merges from GitHub.
 2. Resolve conflicts, investigate CI, and process every finding in every actionable review comment.
 3. File follow-up issues for valid out-of-scope work.
-4. Commit and push any code changes, then reply to every finding you handled.
+4. Commit and push any code changes, then reply to every finding you handled. (If you didn't `ack` in step 1 because new feedback arrived mid-iteration, `ack` the new items now.)
 5. Re-run `status --brief`. If any review comment is still actionable or partly answered, go back to step 2, even if no code changed this iteration.
 6. **Standalone (`wait`):** if you pushed changes, wait for checks and new reviews (section 6), then start the next iteration. **Under flotilla (`no-wait`):** stop after this pass. Take one `wait-for-checks` snapshot, act on anything it shows that you can fix now, then report and yield. flotilla wakes the crew when checks finish or new review feedback arrives. Don't poll.
 
 The loop exits when no review comment is actionable or partly answered and either nothing was pushed or the checks and reviews after the last push are settled. It also exits after five iterations. Never exit while any finding in any review is unanswered: "no code changes were needed" is not a reason to stop if a finding still lacks a reply.
+
+When the loop exits **converged** — every finding answered — `clear` the pickup label (section 1.1). When it exits for max iterations, or blocked, or yielding under no-wait with findings still open, **leave the label set**: the PR stays visibly not-merge-ready, and the merge-readiness report says so.
+
+## 1.1 Acknowledge and clear the pickup
+
+`ack` makes the work visible on GitHub while you work offline. It adds the `shepherd: addressing` label, which means the PR has unanswered review points and is not merge-ready, and a 👀 reaction to each review item you're about to handle. Pass the ids `status`/`reviews` reported:
+
+```bash
+scripts/pr-shepherd.py ack "$PR_NUMBER" --comment-ids 123 456 789
+```
+
+Issue comments and inline review comments get the reaction. A submitted review's *body* has no reactions endpoint on GitHub, so `ack` labels the PR and reports that id under `unreactable` instead of reacting; the label (and your eventual reply) is its acknowledgement.
+
+The reaction is idempotent (an item you already reacted to is skipped) and adding the label again is harmless, so re-running `ack` as new feedback arrives is safe. `clear` removes the label once you've converged:
+
+```bash
+scripts/pr-shepherd.py clear "$PR_NUMBER"
+```
+
+`status` reports `addressing_label` so you can see whether it is currently set.
 
 ## 1. Assess
 
@@ -211,6 +231,7 @@ When the loop exits, report:
 ### Loop Summary
 - **Iterations:** N
 - **Exit reason:** converged / max iterations / yielded (no-wait)
+- **`shepherd: addressing` label:** cleared (converged) / left set (findings still open)
 
 ### Actions Taken
 - Fixed N review findings

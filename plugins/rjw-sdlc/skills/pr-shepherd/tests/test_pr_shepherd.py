@@ -10,9 +10,11 @@ import textwrap
 import time
 from typing import ClassVar
 import unittest
+from urllib.parse import quote
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "pr-shepherd.py"
+ADDRESSING_LABEL = "shepherd: addressing"
 
 
 class CliHarness(unittest.TestCase):
@@ -34,6 +36,7 @@ class CliHarness(unittest.TestCase):
                 import os
                 from pathlib import Path
                 import sys
+                from urllib.parse import unquote
 
                 args = sys.argv[1:]
                 with Path(os.environ["FAKE_GH_LOG"]).open("a") as log:
@@ -54,6 +57,16 @@ class CliHarness(unittest.TestCase):
                         print(os.environ.get("FAKE_GH_PR_METADATA", "{}"))
                 elif args[:2] == ["pr", "checks"]:
                     print(os.environ.get("FAKE_GH_CHECKS", "[]"))
+                elif (args and args[0] == "api" and "-X" in args and "DELETE" in args
+                      and "/issues/" in args[1] and "/labels/" in args[1]):
+                    # Removing a label from the PR. 404 when it isn't applied.
+                    name = unquote(args[1].split("/labels/", 1)[1])
+                    applied = json.loads(os.environ.get("FAKE_GH_APPLIED_LABELS", "[]"))
+                    if name in applied:
+                        print(json.dumps([]))
+                    else:
+                        print("gh: Label does not exist (HTTP 404)", file=sys.stderr)
+                        sys.exit(1)
                 elif args and args[0] == "api" and "-X" in args:
                     print(json.dumps({"html_url": "https://example.test/comment/1"}))
                 elif args[:2] == ["api", "user"]:
@@ -70,7 +83,16 @@ class CliHarness(unittest.TestCase):
                     print(json.dumps(users[login]))
                 elif args and args[0] == "api":
                     endpoint = args[1]
-                    if endpoint.rstrip("0123456789").endswith("/pulls/"):
+                    if "/reactions" in endpoint:
+                        value = os.environ.get("FAKE_GH_REACTIONS", "[]")
+                    elif "/labels/" in endpoint and "/issues/" not in endpoint:
+                        # Repo label-existence probe: 404 unless the repo defines it.
+                        if os.environ.get("FAKE_GH_REPO_HAS_LABEL"):
+                            value = json.dumps({"name": unquote(endpoint.split("/labels/", 1)[1])})
+                        else:
+                            print("gh: Not Found (HTTP 404)", file=sys.stderr)
+                            sys.exit(1)
+                    elif endpoint.rstrip("0123456789").endswith("/pulls/"):
                         value = os.environ.get(
                             "FAKE_GH_PULL", json.dumps({"user": {"login": "author", "id": 1}})
                         )
@@ -952,6 +974,153 @@ class NoWaitTest(CliHarness):
 
         self.assertEqual(standalone["mode"], "wait")
         self.assertEqual(crew["mode"], "no-wait")
+
+
+class AckClearTest(CliHarness):
+    """`ack` makes offline review work visible on GitHub (an eyes reaction per
+    item plus the `shepherd: addressing` label); `clear` drops the label once
+    the iteration converges (rjw-skills#11)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+
+    def post_endpoints(self) -> list[str]:
+        return [c[1] for c in self.gh_calls() if c[:1] == ["api"] and "POST" in c]
+
+    def reaction_posts(self) -> list[str]:
+        return [e for e in self.post_endpoints() if e.endswith("/reactions")]
+
+    def test_ack_labels_the_pr_creating_the_label_and_reacts_to_comments(self) -> None:
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [{"id": 100, "user": {"login": "reviewer"}, "body": "1. fix",
+              "created_at": "2026-07-18T10:00:00Z"}]
+        )
+        self.env["FAKE_GH_REVIEW_COMMENTS"] = json.dumps(
+            [{"id": 200, "user": {"login": "reviewer"}, "body": "rename this",
+              "created_at": "2026-07-18T10:00:00Z", "path": "a.py", "line": 3}]
+        )
+
+        result = self.run_cli(
+            "ack", str(self.pr_number), "--comment-ids", "100", "200"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertEqual(out["reacted"], [100, 200])
+        self.assertTrue(out["label_set"])
+        posts = self.post_endpoints()
+        # The repo lacked the label, so it is created, then added to the PR.
+        self.assertIn("repos/owner/repo/labels", posts)
+        self.assertIn(f"repos/owner/repo/issues/{self.pr_number}/labels", posts)
+        # Issue comments and inline review comments each react on their own endpoint.
+        self.assertEqual(
+            sorted(self.reaction_posts()),
+            sorted([
+                "repos/owner/repo/issues/comments/100/reactions",
+                "repos/owner/repo/pulls/comments/200/reactions",
+            ]),
+        )
+
+    def test_ack_labels_a_review_body_but_cannot_react_to_it(self) -> None:
+        # GitHub's Reactions API has no endpoint for a submitted review's body,
+        # so ack labels the PR and reports the id as unreactable rather than
+        # firing a reaction that would 404.
+        self.env["FAKE_GH_REVIEWS"] = json.dumps(
+            [{"id": 300, "user": {"login": "reviewer"}, "state": "COMMENTED",
+              "body": "overall note", "submitted_at": "2026-07-18T10:00:00Z"}]
+        )
+
+        result = self.run_cli("ack", str(self.pr_number), "--comment-ids", "300")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertEqual(out["unreactable"], [300])
+        self.assertEqual(out["reacted"], [])
+        self.assertEqual(self.reaction_posts(), [])
+        self.assertIn(f"repos/owner/repo/issues/{self.pr_number}/labels", self.post_endpoints())
+
+    def test_ack_does_not_recreate_a_label_the_repo_already_has(self) -> None:
+        self.env["FAKE_GH_REPO_HAS_LABEL"] = "1"
+
+        result = self.run_cli("ack", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        posts = self.post_endpoints()
+        self.assertNotIn("repos/owner/repo/labels", posts)
+        # It is still applied to the PR.
+        self.assertIn(f"repos/owner/repo/issues/{self.pr_number}/labels", posts)
+
+    def test_ack_skips_an_item_this_account_already_reacted_to(self) -> None:
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [{"id": 100, "user": {"login": "reviewer"}, "body": "fix",
+              "created_at": "2026-07-18T10:00:00Z"}]
+        )
+        self.env["FAKE_GH_REACTIONS"] = json.dumps(
+            [{"content": "eyes", "user": {"login": "author"}}]
+        )
+
+        result = self.run_cli("ack", str(self.pr_number), "--comment-ids", "100")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertEqual(out["already_reacted"], [100])
+        self.assertEqual(out["reacted"], [])
+        self.assertEqual(self.reaction_posts(), [])
+
+    def test_ack_reacts_when_only_another_account_has_reacted(self) -> None:
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [{"id": 100, "user": {"login": "reviewer"}, "body": "fix",
+              "created_at": "2026-07-18T10:00:00Z"}]
+        )
+        self.env["FAKE_GH_REACTIONS"] = json.dumps(
+            [{"content": "eyes", "user": {"login": "someone-else"}},
+             {"content": "heart", "user": {"login": "author"}}]
+        )
+
+        result = self.run_cli("ack", str(self.pr_number), "--comment-ids", "100")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["reacted"], [100])
+        self.assertEqual(
+            self.reaction_posts(), ["repos/owner/repo/issues/comments/100/reactions"]
+        )
+
+    def test_clear_removes_the_label(self) -> None:
+        self.env["FAKE_GH_APPLIED_LABELS"] = json.dumps([ADDRESSING_LABEL])
+
+        result = self.run_cli("clear", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["removed"])
+        deletes = [c for c in self.gh_calls() if "DELETE" in c]
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(
+            deletes[0][1],
+            f"repos/owner/repo/issues/{self.pr_number}/labels/{quote(ADDRESSING_LABEL)}",
+        )
+
+    def test_clear_is_a_no_op_when_the_label_is_absent(self) -> None:
+        # FAKE_GH_APPLIED_LABELS unset: the DELETE 404s and is tolerated.
+        result = self.run_cli("clear", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)["removed"])
+
+    def test_status_reports_whether_the_addressing_label_is_set(self) -> None:
+        # Distinct PR numbers so the per-PR metadata cache doesn't carry the
+        # first probe's labels into the second.
+        meta = json.loads(self.pr_metadata("author"))
+        meta["labels"] = [{"name": ADDRESSING_LABEL}]
+        self.env["FAKE_GH_PR_METADATA"] = json.dumps(meta)
+        with_label = json.loads(self.run_cli("status", str(self.pr_number)).stdout)
+        self.assertTrue(with_label["addressing_label"])
+
+        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        without_label = json.loads(
+            self.run_cli("status", str(self.pr_number + 1)).stdout
+        )
+        self.assertFalse(without_label["addressing_label"])
 
 
 if __name__ == "__main__":
