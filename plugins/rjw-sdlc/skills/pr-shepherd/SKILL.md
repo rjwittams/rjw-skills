@@ -52,7 +52,7 @@ Each iteration:
 
 The loop exits when no review comment is actionable or partly answered and either nothing was pushed or the checks and reviews after the last push are settled. It also exits after five iterations. Never exit while any finding in any review is unanswered: "no code changes were needed" is not a reason to stop if a finding still lacks a reply.
 
-When the loop exits **converged** — every finding answered — `clear` the pickup label (section 1.1). When it exits for max iterations, or blocked, or yielding under no-wait with findings still open, **leave the label set**: the PR stays visibly not-merge-ready, and the merge-readiness report says so.
+The pickup label clears itself: `reply --all-handled` and `status` both drop it once review findings have converged, so you don't need to remember `clear` (section 1.1). While any finding is still open — max iterations, blocked, or yielding under no-wait — the label stays set, and the merge-readiness report says so.
 
 ## 1.1 Acknowledge and clear the pickup
 
@@ -64,7 +64,11 @@ scripts/pr-shepherd.py ack "$PR_NUMBER" --comment-ids 123 456 789
 
 Issue comments and inline review comments get the reaction. A submitted review's *body* has no reactions endpoint on GitHub, so `ack` labels the PR and reports that id under `unreactable` instead of reacting; the label (and your eventual reply) is its acknowledgement.
 
-The reaction is idempotent (an item you already reacted to is skipped) and adding the label again is harmless, so re-running `ack` as new feedback arrives is safe. `clear` removes the label once you've converged:
+The reaction is idempotent (an item you already reacted to is skipped) and adding the label again is harmless, so re-running `ack` as new feedback arrives is safe.
+
+**Clearing is automatic.** You don't call `clear` in the normal flow. Once review findings have converged — no reviewer comment, review body, or thread open or partly answered — both `reply --all-handled` and `status` drop the label for you: the `--all-handled` reply that settles the last comment clears it (`"addressing_label": "cleared"` in its output), and a later `status` clears it too if one is still set (`addressing_label_cleared: true`), so status is self-healing. Convergence here is **review feedback only**: pending or failing checks and merge conflicts do not keep the label set, because its claim is "unanswered review points remain", not "not yet mergeable for any reason". While a crew stalls or yields with findings still open, the label stays on.
+
+`clear` remains as an explicit escape hatch — to drop the label by hand, or where no converging command will run next. It removes the label unconditionally:
 
 ```bash
 scripts/pr-shepherd.py clear "$PR_NUMBER"
@@ -231,7 +235,7 @@ When the loop exits, report:
 ### Loop Summary
 - **Iterations:** N
 - **Exit reason:** converged / max iterations / yielded (no-wait)
-- **`shepherd: addressing` label:** cleared (converged) / left set (findings still open)
+- **`shepherd: addressing` label:** cleared automatically on convergence / left set (findings still open)
 
 ### Actions Taken
 - Fixed N review findings
