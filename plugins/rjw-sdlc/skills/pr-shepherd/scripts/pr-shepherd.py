@@ -19,14 +19,19 @@ Write subcommands:
                              needs --finding LABEL (repeatable) and/or --all-handled
     ack <PR> [--comment-ids] Acknowledge pickup: add the `shepherd: addressing`
                              label and 👀-react to the named review items
-    clear <PR>               Remove the `shepherd: addressing` label on converge
+    clear <PR>               Remove the `shepherd: addressing` label (explicit;
+                             `status` and `reply --all-handled` also clear it
+                             automatically once review findings have converged)
 
 Pickup signal: while a crew works a review offline (fix, test, push, reply can
 take an hour), the PR looks untouched. `ack` makes the work visible on GitHub —
-a `shepherd: addressing` label meaning "unanswered points remain; not
+a `shepherd: addressing` label meaning "unanswered review points remain; not
 merge-ready", plus an eyes reaction on each comment it is handling (a review
-body has no reactions endpoint, so the label covers it). `clear` removes the
-label once the iteration converges; a stalled or blocked crew leaves it set.
+body has no reactions endpoint, so the label covers it). The label clears
+itself once review findings converge: `reply --all-handled` and `status` both
+drop it when no reviewer comment is open or partly answered (review feedback
+only — pending or failing checks don't keep it set). `clear` is the explicit
+form; a stalled or blocked crew, with findings still open, leaves it set.
 
 Identity: comments by the PR author and by you are never actionable. Under a
 GitHub App installation token, name yourself with --as <app-slug>[bot] or
@@ -89,8 +94,11 @@ NO_WAIT_ENV = "FLOTILLA_CREW_ID"
 # Pickup signal (rjw-skills#11). `ack` marks a PR as being worked on so the
 # owner, who merges from GitHub, can tell "a crew is on it" from "ignored"
 # during the long offline fix/test/push window. The label means the PR still
-# has unanswered review points and is not merge-ready; `clear` removes it when
-# the iteration converges, a stalled crew leaves it set.
+# has unanswered review points and is not merge-ready. Clearing is deterministic
+# (rjw-skills#12): `status` and `reply --all-handled` drop the label the moment
+# review findings converge, so no-wait crews that answer every finding and
+# complete don't strand it set. A stalled crew with findings still open leaves
+# it on; `clear` is the explicit form.
 ADDRESSING_LABEL = "shepherd: addressing"
 ADDRESSING_LABEL_DESCRIPTION = "A crew is processing review feedback; not merge-ready"
 ADDRESSING_LABEL_COLOR = "fbca04"
@@ -559,6 +567,16 @@ def _addressing_label_set(meta: dict) -> bool:
     )
 
 
+def _clear_addressing_label(repo: str, pr: int) -> bool:
+    """Remove the addressing label and refresh cached metadata; return whether
+    it had been set. Shared by `clear` and by the convergence self-heal in
+    `status` and `reply`."""
+    removed = _remove_addressing_label(repo, pr)
+    if removed:
+        _invalidate_cache(f"pr_{pr}_meta*")
+    return removed
+
+
 def _invalidate_cache(pattern: str) -> None:
     """Remove cached files matching a glob pattern."""
     for path in CACHE_DIR.glob(pattern):
@@ -737,10 +755,15 @@ class Feedback:
         own_ids: set[int],
         review_bots: set[str],
         marker_sources: list[dict],
+        extra_addressed: set[int] | None = None,
     ) -> None:
         self.own_ids = own_ids
         self.review_bots = review_bots
-        self.addressed = _find_addressed_comment_ids(marker_sources)
+        # `extra_addressed` names comments to treat as settled on top of the
+        # markers already on GitHub: used right after a `reply --all-handled`
+        # so convergence reflects the comment this reply just settled without
+        # waiting for GitHub to echo the new reply back.
+        self.addressed = _find_addressed_comment_ids(marker_sources) | (extra_addressed or set())
         self.answered = _find_answered_findings(marker_sources)
         self.ignored_bots: set[str] = set()
 
@@ -930,11 +953,26 @@ def _check_new_reviews(pr: int, repo: str, since: str, exclude_authors: set[str]
 
 # ── Subcommands ────────────────────────────────────────────────────────
 
-def cmd_status(args: argparse.Namespace) -> None:
-    """PR status with actionable assessment."""
-    pr = _resolve_pr_number(args.pr_number)
-    repo = _get_repo()
+def _assess_pr(
+    pr: int,
+    repo: str,
+    args: argparse.Namespace,
+    extra_addressed: set[int] | None = None,
+) -> dict:
+    """Fetch a PR and compute the review/check facts `status` and convergence need.
 
+    `extra_addressed` names comments to treat as fully addressed on top of the
+    markers already on GitHub — used right after a `reply --all-handled` posts,
+    so convergence reflects the comment this reply just settled without waiting
+    for GitHub to echo the new reply back.
+
+    The returned `review_findings_open` is the convergence signal the addressing
+    label tracks: True while any reviewer comment, review body, or unresolved
+    thread is still open or only partly answered. It covers review feedback
+    only — not CI failures, pending checks, or merge conflicts — because the
+    label means "unanswered review points remain", not "not yet mergeable for
+    any reason".
+    """
     meta = fetch_pr_metadata(pr)
     checks = fetch_pr_checks(pr)
     reviews = fetch_pr_reviews(pr, repo)
@@ -950,13 +988,13 @@ def cmd_status(args: argparse.Namespace) -> None:
     if as_identity:
         own_ids.add(as_identity["id"])
 
-    pr_author = meta.get("author", {}).get("login", "")
     # Replies land on whichever surface they answer (a reply to a review
     # body is an issue comment), so read markers from both.
     feedback = Feedback(
         own_ids,
         _parse_review_bots(args.review_bots),
         issue_comments + review_comments,
+        extra_addressed,
     )
 
     unresolved, open_review_comment_ids = feedback.open_threads(
@@ -995,6 +1033,7 @@ def cmd_status(args: argparse.Namespace) -> None:
         + [comment["id"] for comment in actionable_issue_comments]
     )
     partially_answered = feedback.partially_answered(open_ids)
+    reviewer_issue_comments = len(actionable_issue_comments)
 
     merge_state = meta.get("mergeable", "UNKNOWN")
 
@@ -1011,7 +1050,6 @@ def cmd_status(args: argparse.Namespace) -> None:
         action_items.append(f"address {len(unresolved)} unresolved review threads")
     if actionable_reviews:
         action_items.append(f"address {len(actionable_reviews)} review bodies from reviewers")
-    reviewer_issue_comments = len(actionable_issue_comments)
     if reviewer_issue_comments > 0:
         action_items.append(f"evaluate {reviewer_issue_comments} issue comments from reviewers/bots")
     if partially_answered:
@@ -1020,6 +1058,65 @@ def cmd_status(args: argparse.Namespace) -> None:
             f"finish {len(partially_answered)} partly answered comments ({ids}): "
             "answer every remaining finding, then reply --all-handled"
         )
+
+    # Review feedback only — the label's claim is about review points, so CI
+    # and conflict action items deliberately don't keep it set.
+    review_findings_open = bool(
+        unresolved or actionable_reviews or actionable_issue_comments or partially_answered
+    )
+
+    return {
+        "meta": meta,
+        "check_info": check_info,
+        "review_summary": review_summary,
+        "unresolved": unresolved,
+        "actionable_reviews": actionable_reviews,
+        "reviewer_issue_comments": reviewer_issue_comments,
+        "addressed_review_comment_ids": addressed_review_comment_ids,
+        "approving_review_comment_ids": approving_review_comment_ids,
+        "addressed_comment_ids": addressed_comment_ids,
+        "approving_comment_ids": approving_comment_ids,
+        "partially_answered": partially_answered,
+        "answered": feedback.answered,
+        "ignored_bots": feedback.ignored_bots,
+        "comments_by_author": comments_by_author,
+        "body_refs": body_refs,
+        "total_issue_comments": len(issue_comments),
+        "merge_state": merge_state,
+        "action_items": action_items,
+        "review_findings_open": review_findings_open,
+    }
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    """PR status with actionable assessment."""
+    pr = _resolve_pr_number(args.pr_number)
+    repo = _get_repo()
+
+    a = _assess_pr(pr, repo, args)
+    meta = a["meta"]
+    check_info = a["check_info"]
+    review_summary = a["review_summary"]
+    unresolved = a["unresolved"]
+    actionable_reviews = a["actionable_reviews"]
+    reviewer_issue_comments = a["reviewer_issue_comments"]
+    partially_answered = a["partially_answered"]
+    merge_state = a["merge_state"]
+    action_items = a["action_items"]
+
+    pr_author = meta.get("author", {}).get("login", "")
+
+    # Self-heal the pickup label: once review findings have converged its claim
+    # ("unanswered review points remain") is false, so drop it even if checks
+    # are still pending or failing (section 1.1). A later status is then
+    # consistent without anyone remembering to run `clear`.
+    label_set = _addressing_label_set(meta)
+    addressing_cleared = False
+    if label_set and not a["review_findings_open"]:
+        if _clear_addressing_label(repo, pr):
+            label_set = False
+            addressing_cleared = True
+
     mode = "no-wait" if _no_wait(args) else "wait"
 
     result = {
@@ -1044,22 +1141,22 @@ def cmd_status(args: argparse.Namespace) -> None:
             "has_changes_requested": any(r["latest_state"] == "CHANGES_REQUESTED" for r in review_summary),
             "unresolved_threads": len(unresolved),
             "actionable_review_ids": sorted(review["id"] for review in actionable_reviews),
-            "addressed_comment_ids": sorted(addressed_review_comment_ids),
-            "approving_comment_ids": sorted(approving_review_comment_ids),
+            "addressed_comment_ids": sorted(a["addressed_review_comment_ids"]),
+            "approving_comment_ids": sorted(a["approving_review_comment_ids"]),
         },
         "issue_comments": {
-            "total": len(issue_comments),
-            "by_author": comments_by_author,
+            "total": a["total_issue_comments"],
+            "by_author": a["comments_by_author"],
             "actionable": reviewer_issue_comments,
-            "addressed_ids": sorted(addressed_comment_ids),
-            "approving_ids": sorted(approving_comment_ids),
+            "addressed_ids": sorted(a["addressed_comment_ids"]),
+            "approving_ids": sorted(a["approving_comment_ids"]),
         },
         "partially_answered": {
-            str(i): feedback.answered[i] for i in partially_answered
+            str(i): a["answered"][i] for i in partially_answered
         },
-        "ignored_bot_authors": sorted(feedback.ignored_bots),
-        "addressing_label": _addressing_label_set(meta),
-        "linked_issues": body_refs,
+        "ignored_bot_authors": sorted(a["ignored_bots"]),
+        "addressing_label": label_set,
+        "linked_issues": a["body_refs"],
         "mode": mode,
         "needs_attention": len(action_items) > 0,
         "action_items": action_items,
@@ -1092,6 +1189,11 @@ def cmd_status(args: argparse.Namespace) -> None:
             "needs_attention": len(action_items) > 0,
             "action_items": action_items,
         }
+
+    # Only when this call actually dropped the label, so convergent runs that
+    # never had it (the common case) keep their output shape unchanged.
+    if addressing_cleared:
+        result["addressing_label_cleared"] = True
 
     json.dump(result, sys.stdout, indent=2)
     print()
@@ -1450,6 +1552,23 @@ def cmd_comment(args: argparse.Namespace) -> None:
     print(json.dumps({"ok": True, "url": comment_url}))
 
 
+def _autoclear_after_reply(repo: str, pr: int, comment_id: int, args: argparse.Namespace) -> str | None:
+    """Drop the addressing label when this `--all-handled` reply converges the PR.
+
+    Treats `comment_id` as settled (its addresses marker was just posted) and
+    recomputes review-finding convergence. Returns "cleared" when it removed
+    the label, else None. A cheap metadata read short-circuits when the label
+    isn't set, so the common case spends only one extra call.
+    """
+    meta = fetch_pr_metadata(pr)
+    if not _addressing_label_set(meta):
+        return None
+    assessment = _assess_pr(pr, repo, args, extra_addressed={comment_id})
+    if assessment["review_findings_open"]:
+        return None
+    return "cleared" if _clear_addressing_label(repo, pr) else None
+
+
 def cmd_reply(args: argparse.Namespace) -> None:
     """Reply to a review comment, auto-detecting the correct endpoint.
 
@@ -1489,7 +1608,7 @@ def cmd_reply(args: argparse.Namespace) -> None:
         )
         _invalidate_cache(f"pr_{pr}_review_comments*")
         comment_url = result.get("html_url", "")
-        print(json.dumps({"ok": True, "type": "thread_reply", "url": comment_url}))
+        response = {"ok": True, "type": "thread_reply", "url": comment_url}
     else:
         print(
             f"Comment {comment_id} is not an inline review comment; "
@@ -1499,7 +1618,16 @@ def cmd_reply(args: argparse.Namespace) -> None:
         result = _gh_api_post(f"repos/{repo}/issues/{pr}/comments", {"body": body})
         _invalidate_cache(f"pr_{pr}_issue_comments*")
         comment_url = result.get("html_url", "")
-        print(json.dumps({"ok": True, "type": "top_level_fallback", "url": comment_url}))
+        response = {"ok": True, "type": "top_level_fallback", "url": comment_url}
+
+    # Settling the last open comment converges the PR; clear the pickup label
+    # so the owner, who merges from GitHub, isn't told it's still not ready.
+    if args.all_handled:
+        cleared = _autoclear_after_reply(repo, pr, comment_id, args)
+        if cleared:
+            response["addressing_label"] = cleared
+
+    print(json.dumps(response))
 
 
 def cmd_ack(args: argparse.Namespace) -> None:
@@ -1557,16 +1685,16 @@ def cmd_ack(args: argparse.Namespace) -> None:
 
 
 def cmd_clear(args: argparse.Namespace) -> None:
-    """Clear the addressing label once the iteration has converged.
+    """Clear the addressing label explicitly.
 
-    A no-op when the label isn't set. Call it only when every finding is
-    answered: a stalled or blocked crew should leave the label on so the PR
-    stays visibly not-merge-ready.
+    A no-op when the label isn't set. `status` and `reply --all-handled` clear
+    it on their own once review findings converge, so this is mainly an escape
+    hatch — to drop it by hand, or where no converging command will run next.
+    It removes the label unconditionally; it does not re-check convergence.
     """
     pr = _resolve_pr_number(args.pr_number)
     repo = _get_repo()
-    removed = _remove_addressing_label(repo, pr)
-    _invalidate_cache(f"pr_{pr}_meta*")
+    removed = _clear_addressing_label(repo, pr)
     print(json.dumps({
         "ok": True,
         "label": ADDRESSING_LABEL,

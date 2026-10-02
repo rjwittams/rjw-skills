@@ -134,6 +134,15 @@ class CliHarness(unittest.TestCase):
     def gh_calls(self) -> list[list[str]]:
         return [json.loads(line) for line in self.gh_log.read_text().splitlines()]
 
+    def reply_post(self) -> list[str]:
+        """The reply's POST call, located by its body= field rather than by
+        position: `reply --all-handled` runs a convergence check afterward, so
+        it is no longer the last gh invocation."""
+        return next(
+            call for call in reversed(self.gh_calls())
+            if any(arg.startswith("body=") for arg in call)
+        )
+
     def pr_metadata(self, author_login: str) -> str:
         return json.dumps(
             {
@@ -185,7 +194,7 @@ class PrShepherdCliTest(CliHarness):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        post = self.gh_calls()[-1]
+        post = self.reply_post()
         self.assertIn(
             "body=Fixed the reported race.\n\n"
             "<!-- pr-shepherd-addresses:9001 -->\n",
@@ -722,7 +731,7 @@ class PerFindingTest(CliHarness):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        body = next(arg for arg in self.gh_calls()[-1] if arg.startswith("body="))
+        body = next(arg for arg in self.reply_post() if arg.startswith("body="))
         self.assertTrue(body.endswith(
             "<!-- pr-shepherd-finding:9701:1 -->\n"
             "<!-- pr-shepherd-finding:9701:2 -->\n"
@@ -1108,6 +1117,12 @@ class AckClearTest(CliHarness):
         self.assertFalse(json.loads(result.stdout)["removed"])
 
     def test_status_reports_whether_the_addressing_label_is_set(self) -> None:
+        # An open finding keeps the label legitimately set, so status reports
+        # it rather than self-healing it away (that case is covered below).
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [{"id": 100, "user": {"login": "reviewer"}, "body": "1. fix this",
+              "created_at": "2026-07-18T10:00:00Z"}]
+        )
         # Distinct PR numbers so the per-PR metadata cache doesn't carry the
         # first probe's labels into the second.
         meta = json.loads(self.pr_metadata("author"))
@@ -1115,12 +1130,147 @@ class AckClearTest(CliHarness):
         self.env["FAKE_GH_PR_METADATA"] = json.dumps(meta)
         with_label = json.loads(self.run_cli("status", str(self.pr_number)).stdout)
         self.assertTrue(with_label["addressing_label"])
+        self.assertNotIn("addressing_label_cleared", with_label)
 
         self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
         without_label = json.loads(
             self.run_cli("status", str(self.pr_number + 1)).stdout
         )
         self.assertFalse(without_label["addressing_label"])
+
+
+class AutoClearConvergenceTest(CliHarness):
+    """The addressing label clears itself once review findings converge, so a
+    no-wait crew that answers every finding and completes doesn't strand it set
+    (rjw-skills#12). Convergence is review feedback only — not CI or conflicts.
+    """
+
+    LABELLED: ClassVar[list] = [{"name": ADDRESSING_LABEL}]
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The PR carries the label, and the repo has it applied so a DELETE
+        # succeeds rather than 404ing.
+        meta = json.loads(self.pr_metadata("author"))
+        meta["labels"] = self.LABELLED
+        self.env["FAKE_GH_PR_METADATA"] = json.dumps(meta)
+        self.env["FAKE_GH_APPLIED_LABELS"] = json.dumps([ADDRESSING_LABEL])
+
+    def label_deletes(self) -> list[list[str]]:
+        return [
+            c for c in self.gh_calls()
+            if "DELETE" in c and "/labels/" in c[1] and "/issues/" in c[1]
+        ]
+
+    def open_issue_comment(self, comment_id: int, body: str = "1. fix this") -> dict:
+        return {
+            "id": comment_id,
+            "user": {"login": "reviewer"},
+            "body": body,
+            "created_at": "2026-07-18T10:00:00Z",
+        }
+
+    def test_reply_all_handled_clears_the_label_on_the_last_open_comment(self) -> None:
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps([self.open_issue_comment(100)])
+
+        result = self.run_cli(
+            "reply", str(self.pr_number), "100", "--all-handled", "-",
+            input_text="Fixed.",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["addressing_label"], "cleared")
+        self.assertEqual(len(self.label_deletes()), 1)
+
+    def test_reply_all_handled_leaves_the_label_when_a_comment_is_still_open(self) -> None:
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [self.open_issue_comment(100), self.open_issue_comment(101, "2. and this")]
+        )
+
+        result = self.run_cli(
+            "reply", str(self.pr_number), "100", "--all-handled", "-",
+            input_text="Fixed one.",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("addressing_label", json.loads(result.stdout))
+        self.assertEqual(self.label_deletes(), [])
+
+    def test_reply_finding_only_never_clears_the_label(self) -> None:
+        # --finding records progress but leaves the comment open, so there is
+        # no convergence to act on and no metadata is even fetched to check.
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps([self.open_issue_comment(100)])
+
+        result = self.run_cli(
+            "reply", str(self.pr_number), "100", "--finding", "1", "-",
+            input_text="Working on it.",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("addressing_label", json.loads(result.stdout))
+        self.assertEqual(self.label_deletes(), [])
+
+    def test_status_clears_the_label_when_nothing_is_outstanding(self) -> None:
+        result = self.run_cli("status", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(result.stdout)
+        self.assertFalse(status["addressing_label"])
+        self.assertTrue(status["addressing_label_cleared"])
+        self.assertEqual(len(self.label_deletes()), 1)
+
+    def test_status_brief_also_clears_and_reports_it(self) -> None:
+        result = self.run_cli("status", str(self.pr_number), "--brief")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["addressing_label_cleared"])
+        self.assertEqual(len(self.label_deletes()), 1)
+
+    def test_status_leaves_the_label_when_findings_remain(self) -> None:
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps([self.open_issue_comment(100)])
+
+        result = self.run_cli("status", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(result.stdout)
+        self.assertTrue(status["addressing_label"])
+        self.assertNotIn("addressing_label_cleared", status)
+        self.assertEqual(self.label_deletes(), [])
+
+    def test_failing_checks_do_not_keep_the_label_set(self) -> None:
+        # The label's claim is "unanswered review points remain", so review
+        # convergence clears it even while checks still need fixing.
+        self.env["FAKE_GH_CHECKS"] = json.dumps(
+            [{"name": "test", "bucket": "fail", "link": ""}]
+        )
+
+        result = self.run_cli("status", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(result.stdout)
+        self.assertTrue(status["addressing_label_cleared"])
+        self.assertTrue(status["needs_attention"])
+        self.assertIn("fix failing checks: test", status["action_items"])
+
+    def test_nothing_breaks_when_the_label_is_absent(self) -> None:
+        # No label on the PR: converged status and reply both no-op on the
+        # label without erroring or issuing a DELETE.
+        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        self.env["FAKE_GH_APPLIED_LABELS"] = json.dumps([])
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps([self.open_issue_comment(100)])
+
+        status = self.run_cli("status", str(self.pr_number))
+        reply = self.run_cli(
+            "reply", str(self.pr_number), "100", "--all-handled", "-",
+            input_text="Fixed.",
+        )
+
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(reply.returncode, 0, reply.stderr)
+        self.assertFalse(json.loads(status.stdout)["addressing_label"])
+        self.assertNotIn("addressing_label_cleared", json.loads(status.stdout))
+        self.assertNotIn("addressing_label", json.loads(reply.stdout))
+        self.assertEqual(self.label_deletes(), [])
 
 
 if __name__ == "__main__":
