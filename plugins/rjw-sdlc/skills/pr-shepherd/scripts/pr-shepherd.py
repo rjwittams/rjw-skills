@@ -586,6 +586,9 @@ def _invalidate_cache(pattern: str) -> None:
 def _read_body(body: str | None, body_file: Path | None) -> str:
     """Resolve a command body from an argument, stdin, or a file."""
     if body_file is not None:
+        # `--body-file -` follows the gh convention: read standard input.
+        if str(body_file) == "-":
+            return sys.stdin.read()
         try:
             return body_file.read_text()
         except OSError as error:
@@ -1775,7 +1778,7 @@ def main() -> None:
     p_comment.add_argument("pr_number", type=int, help="PR number")
     comment_body = p_comment.add_mutually_exclusive_group(required=True)
     comment_body.add_argument("body", nargs="?", help="Comment body text, or - for stdin")
-    comment_body.add_argument("--body-file", type=Path, help="Read comment body from file")
+    comment_body.add_argument("--body-file", type=Path, help="Read comment body from file, or - for stdin")
     p_comment.set_defaults(func=cmd_comment)
 
     # reply (write)
@@ -1784,7 +1787,7 @@ def main() -> None:
     p_reply.add_argument("comment_id", type=int, help="Comment ID to reply to")
     reply_body = p_reply.add_mutually_exclusive_group(required=True)
     reply_body.add_argument("body", nargs="?", help="Reply body text, or - for stdin")
-    reply_body.add_argument("--body-file", type=Path, help="Read reply body from file")
+    reply_body.add_argument("--body-file", type=Path, help="Read reply body from file, or - for stdin")
     p_reply.add_argument("--finding", dest="findings", action="append", metavar="LABEL",
                          help="Label of a finding this reply answers, e.g. 1, 2, nit-3 "
                               "(repeatable). Leaves the comment actionable")

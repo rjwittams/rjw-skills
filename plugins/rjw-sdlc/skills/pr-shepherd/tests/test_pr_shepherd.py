@@ -186,6 +186,32 @@ class PrShepherdCliTest(CliHarness):
         post = self.gh_calls()[-1]
         self.assertIn(f"body={body}", post)
 
+    def test_comment_body_file_dash_reads_stdin(self) -> None:
+        body = "Read from `stdin` via --body-file -.\n"
+
+        result = self.run_cli(
+            "comment", str(self.pr_number), "--body-file", "-", input_text=body
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        post = self.gh_calls()[-1]
+        self.assertIn(f"body={body}", post)
+
+    def test_reply_body_file_dash_reads_stdin(self) -> None:
+        body = "Fixed via --body-file -.\n"
+
+        result = self.run_cli(
+            "reply", str(self.pr_number), "9001", "--all-handled", "--body-file", "-",
+            input_text=body,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "body=Fixed via --body-file -.\n\n"
+            "<!-- pr-shepherd-addresses:9001 -->\n",
+            self.reply_post(),
+        )
+
     def test_reply_records_the_exact_comment_id_it_addresses(self) -> None:
         body = "Fixed the reported race.\n"
 
