@@ -46,6 +46,12 @@ reviews, and resolved threads.
 
 No-wait mode: with --no-wait, or when FLOTILLA_CREW_ID is set, wait-for-checks
 returns one snapshot instead of polling; the caller replies and yields.
+
+API budget: reads use the REST API only. `gh pr view`, `gh pr checks` and
+`gh repo view` spend the GraphQL budget that every gh command and agent session
+on the machine shares. The one GraphQL query left, review-thread resolution,
+runs from `status` only when an inline thread would otherwise be open, and
+never from wait-for-checks.
 """
 from __future__ import annotations
 
@@ -116,6 +122,12 @@ MERGEABLE_RE = re.compile(
     re.IGNORECASE,
 )
 QUALIFIED_FINDINGS_RE = re.compile(r"^(?:beyond|except|other than)\b", re.IGNORECASE)
+# wait-for-checks pacing: start at the base interval, multiply by the
+# backoff after each poll that sees no change, cap at the max, and reset to
+# the base when anything changes.
+WAIT_BASE_INTERVAL = 60
+WAIT_BACKOFF = 1.5
+WAIT_MAX_INTERVAL = 180
 
 
 def _cache_path(name: str) -> Path:
@@ -156,34 +168,18 @@ def _record_ci_duration(seconds: float) -> None:
 
 
 # ── Data fetching ──────────────────────────────────────────────────────
+#
+# API budget. Every read below goes through GitHub's REST API (`gh api
+# <path>`), which has its own 5,000 requests/hour budget. `gh pr view`,
+# `gh pr checks` and `gh repo view` are GraphQL-backed, and the GraphQL
+# budget (5,000 points/hour) is shared by every gh command and every agent
+# session on the machine; CI-wait loops built on them exhausted it
+# (2026-10-08). Read through REST only. The single remaining GraphQL query
+# is review-thread resolution, which REST cannot answer; see
+# fetch_resolved_thread_root_ids for when it runs.
 
-def _gh_json(args: list[str], cache_name: str) -> dict | list:
-    """Run a gh command that returns JSON, with file-based caching."""
-    cached = _cache_path(cache_name)
-    if _is_fresh(cached):
-        return json.loads(cached.read_text())
-
-    result = subprocess.run(
-        ["gh"] + args,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if result.returncode != 0:
-        print(f"Error running gh {' '.join(args)}: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-    data = json.loads(result.stdout)
-    cached.write_text(json.dumps(data))
-    return data
-
-
-def _gh_api(endpoint: str, cache_name: str) -> dict | list:
-    """Run a gh api command, with file-based caching."""
-    cached = _cache_path(cache_name)
-    if _is_fresh(cached):
-        return json.loads(cached.read_text())
-
+def _gh_api_fetch(endpoint: str) -> dict | list:
+    """GET a REST endpoint through `gh api`, exiting on failure."""
     result = subprocess.run(
         ["gh", "api", endpoint],
         capture_output=True,
@@ -193,19 +189,126 @@ def _gh_api(endpoint: str, cache_name: str) -> dict | list:
     if result.returncode != 0:
         print(f"Error running gh api {endpoint}: {result.stderr}", file=sys.stderr)
         sys.exit(1)
+    return json.loads(result.stdout)
 
-    data = json.loads(result.stdout)
+
+def _gh_api(endpoint: str, cache_name: str) -> dict | list:
+    """Run a gh api command, with file-based caching."""
+    cached = _cache_path(cache_name)
+    if _is_fresh(cached):
+        return json.loads(cached.read_text())
+
+    data = _gh_api_fetch(endpoint)
     cached.write_text(json.dumps(data))
     return data
+
+
+PAGE_SIZE = 100
+
+
+def _gh_api_pages(endpoint: str, key: str, tolerate_failure: bool = False) -> list[dict]:
+    """Collect `key` from every page of a REST endpoint that wraps its items
+    in an object with `total_count` (check runs, statuses, workflow runs)."""
+    items: list[dict] = []
+    separator = "&" if "?" in endpoint else "?"
+    page = 1
+    while True:
+        url = f"{endpoint}{separator}per_page={PAGE_SIZE}&page={page}"
+        if tolerate_failure:
+            data = _gh_api_get_live(url)
+            if not isinstance(data, dict):
+                return items
+        else:
+            data = _gh_api_fetch(url)
+            assert isinstance(data, dict)
+        batch = data.get(key) or []
+        items.extend(batch)
+        total = data.get("total_count")
+        if len(batch) < PAGE_SIZE or (isinstance(total, int) and len(items) >= total):
+            return items
+        page += 1
+
+
+def _git(*args: str) -> str | None:
+    """Run a local git command; None when it fails or prints nothing."""
+    try:
+        result = subprocess.run(["git", *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    output = result.stdout.strip()
+    return output if result.returncode == 0 and output else None
+
+
+_REMOTE_URL_RE = re.compile(
+    r"^(?:[a-z+]+://)?(?:[^@/]+@)?(?P<host>[^:/]+)(?::\d+)?[:/]"
+    r"(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?$"
+)
+
+
+def _github_repo_from_url(url: str) -> str | None:
+    """owner/name from a GitHub remote URL (https, ssh or scp-style)."""
+    match = _REMOTE_URL_RE.match(url.strip())
+    if match is None:
+        return None
+    host = match["host"].lower()
+    hosts = {"github.com", "ssh.github.com", (os.environ.get("GH_HOST") or "github.com").lower()}
+    # `github.com-work` style ssh aliases name github.com too.
+    if host not in hosts and not host.startswith("github.com-"):
+        return None
+    return f"{match['owner']}/{match['name']}"
+
+
+def _git_config_entries(pattern: str) -> list[tuple[str, str]]:
+    """(key, value) pairs for git config keys matching a regex."""
+    output = _git("config", "--get-regexp", pattern)
+    if output is None:
+        return []
+    return [tuple(line.split(" ", 1)) for line in output.splitlines() if " " in line]  # type: ignore[misc]
+
+
+def _remote_repos() -> dict[str, str]:
+    """Map each GitHub remote's name to its owner/name."""
+    remotes: dict[str, str] = {}
+    for key, url in _git_config_entries(r"^remote\..*\.url$"):
+        repo = _github_repo_from_url(url)
+        if repo is not None:
+            remotes[key.removeprefix("remote.").removesuffix(".url")] = repo
+    return remotes
+
+
+def _repo_from_git() -> str | None:
+    """The base repository, chosen from git remotes the way gh chooses it:
+    `gh repo set-default` (remote.<name>.gh-resolved) first, then the
+    upstream, github and origin remotes, then any other GitHub remote.
+    Reads only local git config, so it spends no API budget."""
+    remotes = _remote_repos()
+    for key, value in _git_config_entries(r"^remote\..*\.gh-resolved$"):
+        if value != "base" and "/" in value:
+            return value
+        name = key.removeprefix("remote.").removesuffix(".gh-resolved")
+        if value == "base" and name in remotes:
+            return remotes[name]
+    for name in ("upstream", "github", "origin", *sorted(remotes)):
+        if name in remotes:
+            return remotes[name]
+    return None
 
 
 _repo_cache: str | None = None
 
 
 def _get_repo() -> str:
-    """Get owner/repo from git remote (cached after first call)."""
+    """Get owner/repo from the git remotes (cached after first call).
+
+    Falls back to `gh repo view` (one GraphQL query) only when no remote
+    names a GitHub repository; pass -R to avoid even that.
+    """
     global _repo_cache
     if _repo_cache is not None:
+        return _repo_cache
+    from_git = _repo_from_git()
+    if from_git is not None:
+        _repo_cache = from_git
         return _repo_cache
     result = subprocess.run(
         ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
@@ -279,6 +382,63 @@ def _get_current_user() -> str:
     return _user_cache
 
 
+def _current_branch_heads(base_owner: str) -> list[tuple[str, str]]:
+    """Candidate (owner, branch) heads for the current branch's PR, most
+    likely first. Reads local git only.
+
+    The push destination (`@{push}`) comes first, then the push remote
+    (branch.<b>.pushRemote, remote.pushDefault, branch.<b>.remote) with the
+    local branch name and with the tracked branch (branch.<b>.merge). The
+    base repository's owner is tried after the push remote's.
+    """
+    branch = _git("symbolic-ref", "--quiet", "--short", "HEAD")
+    if branch is None:
+        return []
+    remotes = _remote_repos()
+
+    def owner_of(remote: str | None) -> str | None:
+        repo = remotes.get(remote or "")
+        return repo.split("/", 1)[0] if repo else None
+
+    candidates: list[tuple[str | None, str]] = []
+    push = _git("rev-parse", "--abbrev-ref", f"{branch}@{{push}}")
+    if push:
+        for remote in sorted(remotes, key=len, reverse=True):
+            if push.startswith(f"{remote}/"):
+                candidates.append((owner_of(remote), push.removeprefix(f"{remote}/")))
+                break
+    remote = (
+        _git("config", f"branch.{branch}.pushRemote")
+        or _git("config", "remote.pushDefault")
+        or _git("config", f"branch.{branch}.remote")
+    )
+    merge = _git("config", f"branch.{branch}.merge")
+    names = [branch] + ([merge.removeprefix("refs/heads/")] if merge else [])
+    for owner in (owner_of(remote), base_owner):
+        candidates.extend((owner, name) for name in names)
+    return list(dict.fromkeys((o, b) for o, b in candidates if o))  # type: ignore[misc]
+
+
+def _detect_pr_for_current_branch() -> int | None:
+    """Find the PR whose head is the current branch, through REST
+    (`GET /repos/{o}/{r}/pulls?head={owner}:{branch}`).
+
+    An open PR wins; otherwise the most recently created PR for the branch,
+    as `gh pr view` does.
+    """
+    repo = _get_repo()
+    heads = _current_branch_heads(repo.split("/", 1)[0])
+    for state in ("open", "all"):
+        for owner, branch in heads:
+            pulls = _gh_api_get_live(
+                f"repos/{repo}/pulls?head={quote(f'{owner}:{branch}', safe='')}"
+                f"&state={state}&per_page=10"
+            )
+            if isinstance(pulls, list) and pulls:
+                return int(pulls[0]["number"])
+    return None
+
+
 def _resolve_pr_number(pr_number: int | None) -> int:
     """Use an explicit positive PR number or detect one from the current branch."""
     if pr_number is not None:
@@ -287,33 +447,63 @@ def _resolve_pr_number(pr_number: int | None) -> int:
             sys.exit(2)
         return pr_number
 
-    cmd = ["gh", "pr", "view", "--json", "number", "--jq", ".number"]
-    if _repo_cache:
-        cmd.extend(["-R", _repo_cache])
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    detected = result.stdout.strip()
-    if result.returncode != 0 or not detected.isdigit() or int(detected) <= 0:
-        detail = result.stderr.strip()
-        message = "Error: could not detect a pull request for the current branch"
-        if detail:
-            message += f": {detail}"
-        print(message, file=sys.stderr)
+    detected = _detect_pr_for_current_branch()
+    if detected is None or detected <= 0:
+        print("Error: could not detect a pull request for the current branch", file=sys.stderr)
         sys.exit(2)
-    return int(detected)
+    return detected
+
+
+def fetch_pr_pull(pr: int) -> dict:
+    """The PR as REST returns it (`GET /repos/{o}/{r}/pulls/{n}`).
+
+    Cached under the `pr_{pr}_meta` prefix so invalidating metadata also
+    refreshes the head SHA and mergeable state read from it.
+    """
+    pull = _gh_api(f"repos/{_get_repo()}/pulls/{pr}", f"pr_{pr}_meta_rest")
+    assert isinstance(pull, dict)
+    return pull
+
+
+def _gh_author_login(user: dict) -> str:
+    """The login as `gh pr view` renders it: an App is "app/<slug>"."""
+    login = user.get("login", "")
+    if user.get("type") == "Bot" and login.endswith("[bot]"):
+        return "app/" + login.removesuffix("[bot]")
+    return login
+
+
+# REST `mergeable` is a tri-state boolean; the helper reports gh's names.
+_MERGEABLE_NAMES = {True: "MERGEABLE", False: "CONFLICTING", None: "UNKNOWN"}
+
+
+def _meta_from_pull(pull: dict) -> dict:
+    """Shape a REST pull like the `gh pr view --json` fields the helper uses."""
+    state = "MERGED" if pull.get("merged") or pull.get("merged_at") else (pull.get("state") or "").upper()
+    return {
+        "number": pull.get("number"),
+        "title": pull.get("title") or "",
+        "body": pull.get("body") or "",
+        "author": {"login": _gh_author_login(pull.get("user") or {})},
+        "state": state,
+        "isDraft": bool(pull.get("draft")),
+        "baseRefName": (pull.get("base") or {}).get("ref", ""),
+        "headRefName": (pull.get("head") or {}).get("ref", ""),
+        "headRefOid": (pull.get("head") or {}).get("sha", ""),
+        "mergeable": _MERGEABLE_NAMES.get(pull.get("mergeable"), "UNKNOWN"),
+        "url": pull.get("html_url", ""),
+        "createdAt": pull.get("created_at", ""),
+        "updatedAt": pull.get("updated_at", ""),
+        "labels": pull.get("labels") or [],
+        "additions": pull.get("additions", 0),
+        "deletions": pull.get("deletions", 0),
+        "changedFiles": pull.get("changed_files", 0),
+    }
 
 
 def fetch_pr_metadata(pr: int) -> dict:
-    """Fetch core PR metadata."""
-    cmd = [
-        "pr", "view", str(pr),
-        "--json",
-        "number,title,body,author,state,isDraft,baseRefName,headRefName,"
-        "mergeable,url,createdAt,updatedAt,labels,additions,deletions,"
-        "changedFiles,commits",
-    ]
-    if _repo_cache:
-        cmd.extend(["-R", _repo_cache])
-    return _gh_json(cmd, f"pr_{pr}_meta")
+    """Fetch core PR metadata (REST)."""
+    return _meta_from_pull(fetch_pr_pull(pr))
 
 
 def fetch_pr_author(pr: int, repo: str) -> dict:
@@ -324,41 +514,122 @@ def fetch_pr_author(pr: int, repo: str) -> dict:
     author from REST keeps both sides in one vocabulary, and its numeric
     id is what ownership checks compare.
     """
-    pull = _gh_api(f"repos/{repo}/pulls/{pr}", f"pr_{pr}_pull")
-    assert isinstance(pull, dict)
-    return pull["user"]
+    return fetch_pr_pull(pr)["user"]
+
+
+# gh renders a missing timestamp as Go's zero time; keep that spelling so
+# check output matches what `gh pr checks` produced.
+ZERO_TIME = "0001-01-01T00:00:00Z"
+
+
+def _check_bucket(state: str) -> str:
+    """gh's bucket for a check state (pkg/cmd/pr/checks/aggregate.go)."""
+    if state == "SUCCESS":
+        return "pass"
+    if state in ("SKIPPED", "NEUTRAL"):
+        return "skipping"
+    if state in ("ERROR", "FAILURE", "TIMED_OUT", "ACTION_REQUIRED"):
+        return "fail"
+    if state == "CANCELLED":
+        # _classify_check counts this bucket as skipped, as it did when the
+        # rows came from `gh pr checks`.
+        return "cancel"
+    # EXPECTED, REQUESTED, WAITING, QUEUED, PENDING, IN_PROGRESS, STALE
+    return "pending"
+
+
+def _checks_from_rest(
+    check_runs: list[dict],
+    statuses: list[dict],
+    workflow_runs: list[dict] | None = None,
+) -> list[dict]:
+    """Build `gh pr checks --json name,state,startedAt,completedAt,link,
+    bucket,description` rows from REST check runs and commit statuses.
+
+    Mirrors gh: newest first by start time, and one row per check run
+    name within a workflow (or per status context), so a job re-run by
+    another event (a review, a label) shows only its latest run.
+    `workflow_runs` maps check suites to their workflow; it is needed only
+    when two check runs share a name.
+    """
+    suites = {run.get("check_suite_id"): run.get("name") or "" for run in workflow_runs or []}
+    # (dedupe key, tie-break id, row)
+    contexts: list[tuple[tuple, int, dict]] = []
+    for run in check_runs:
+        status = (run.get("status") or "").upper()
+        state = (run.get("conclusion") or "").upper() if status == "COMPLETED" else status
+        workflow = suites.get((run.get("check_suite") or {}).get("id"), "")
+        contexts.append((
+            ("check_run", run.get("name", ""), workflow),
+            run.get("id") or 0,
+            {
+                "name": run.get("name", ""),
+                "state": state,
+                "startedAt": run.get("started_at") or ZERO_TIME,
+                "completedAt": run.get("completed_at") or ZERO_TIME,
+                "link": run.get("details_url") or "",
+                "bucket": _check_bucket(state),
+                "description": "",
+            },
+        ))
+    for status in statuses:
+        state = (status.get("state") or "").upper()
+        contexts.append((
+            ("status", status.get("context", "")),
+            0,
+            {
+                "name": status.get("context", ""),
+                "state": state,
+                "startedAt": ZERO_TIME,
+                "completedAt": ZERO_TIME,
+                "link": status.get("target_url") or "",
+                "bucket": _check_bucket(state),
+                "description": status.get("description") or "",
+            },
+        ))
+    # Newest start first. Among equal start times the lower check run id
+    # sorts first, so deduplication keeps the run gh keeps; statuses (no
+    # start time) keep REST order at the end.
+    contexts.sort(key=lambda item: item[1])
+    contexts.sort(key=lambda item: item[2]["startedAt"], reverse=True)
+    seen: set[tuple] = set()
+    checks = []
+    for key, _, check in contexts:
+        if key in seen:
+            continue
+        seen.add(key)
+        checks.append(check)
+    return checks
 
 
 def fetch_pr_checks(pr: int) -> list[dict]:
-    """Fetch check run results for the PR. Returns [] if no checks exist yet."""
+    """Fetch check results for the PR's head commit. Returns [] if no checks
+    exist yet.
+
+    REST only: check runs (paginated) plus legacy commit statuses, and the
+    workflow runs for the commit when duplicate check names need them to
+    deduplicate. Two or three REST requests, no GraphQL.
+    """
     cached = _cache_path(f"pr_{pr}_checks")
     if _is_fresh(cached):
         return json.loads(cached.read_text())
 
-    cmd = [
-        "gh", "pr", "checks", str(pr),
-        "--json", "name,state,startedAt,completedAt,link,bucket,description",
-    ]
-    if _repo_cache:
-        cmd.extend(["-R", _repo_cache])
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    # "no checks reported" is normal for fresh pushes — return empty list
-    if result.returncode != 0:
-        if "no checks reported" in result.stderr.lower():
-            cached.write_text("[]")
-            return []
-        print(f"Error running gh pr checks: {result.stderr}", file=sys.stderr)
-        sys.exit(1)
-
-    if not result.stdout.strip():
+    repo = _get_repo()
+    sha = (fetch_pr_pull(pr).get("head") or {}).get("sha")
+    if not sha:
         cached.write_text("[]")
         return []
-    data = json.loads(result.stdout)
+    check_runs = _gh_api_pages(f"repos/{repo}/commits/{sha}/check-runs", "check_runs")
+    statuses = _gh_api_pages(f"repos/{repo}/commits/{sha}/status", "statuses")
+    names = [run.get("name") for run in check_runs]
+    workflow_runs = (
+        _gh_api_pages(
+            f"repos/{repo}/actions/runs?head_sha={sha}", "workflow_runs", tolerate_failure=True
+        )
+        if len(set(names)) < len(names)
+        else []
+    )
+    data = _checks_from_rest(check_runs, statuses, workflow_runs)
     cached.write_text(json.dumps(data))
     return data
 
@@ -403,9 +674,16 @@ query($owner: String!, $name: String!, $number: Int!) {
 def fetch_resolved_thread_root_ids(pr: int, repo: str) -> set[int]:
     """Return the root comment ids of review threads GitHub marks resolved.
 
-    Resolution is only visible through GraphQL. If the query fails, treat
-    every thread as unresolved: over-reporting a thread is safe, silently
-    dropping one isn't.
+    This is the helper's one GraphQL query: thread resolution (isResolved)
+    has no REST equivalent, and resolving a thread changes nothing REST can
+    see. To keep it off the shared GraphQL budget it runs only from
+    `_assess_pr` (`status`, and `reply --all-handled` when the addressing
+    label is set), only when some inline thread would otherwise count as
+    open, and at most once per CACHE_TTL. `wait-for-checks` never runs it:
+    its polls and its closing --check-reviews pass read REST only.
+
+    If the query fails, treat every thread as unresolved: over-reporting a
+    thread is safe, silently dropping one isn't.
     """
     cached = _cache_path(f"pr_{pr}_resolved_threads")
     if _is_fresh(cached):
@@ -1000,9 +1278,13 @@ def _assess_pr(
         extra_addressed,
     )
 
-    unresolved, open_review_comment_ids = feedback.open_threads(
-        review_comments, fetch_resolved_thread_root_ids(pr, repo)
-    )
+    # Resolution can only hide threads, so ask GraphQL about it only when
+    # some thread would otherwise be open (see fetch_resolved_thread_root_ids).
+    unresolved, open_review_comment_ids = feedback.open_threads(review_comments, set())
+    if unresolved:
+        unresolved, open_review_comment_ids = feedback.open_threads(
+            review_comments, fetch_resolved_thread_root_ids(pr, repo)
+        )
     addressed_review_comment_ids = _find_addressed_comment_ids(review_comments)
     approving_review_comment_ids = {
         comment["id"]
@@ -1350,23 +1632,27 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
     timeout = args.timeout
     # Timing is the tool's concern, not the caller's (flotilla#885): agents
     # were inventing schedules (--interval 10 --timeout 50, re-invoked in a
-    # loop). The tool owns its pacing outright — --interval is ignored, and
-    # sub-5-minute timeouts are raised so one call means one real wait.
-    # There is deliberately no override: a previous env-var escape hatch
-    # (PR_SHEPHERD_FAST) was discovered and used by every agent within a day
-    # of shipping — advisory infrastructure gets bypassed (flotilla#812).
-    # Humans who genuinely need manual pacing can edit this script.
-    interval = 30
-    if args.interval != 30:
-        print("Note: --interval is tool-managed and was ignored", file=sys.stderr)
+    # loop). Sub-5-minute timeouts are raised so one call means one real
+    # wait, and --interval can only lengthen the base poll interval, never
+    # shorten it below WAIT_BASE_INTERVAL. There is deliberately no override:
+    # a previous env-var escape hatch (PR_SHEPHERD_FAST) was discovered and
+    # used by every agent within a day of shipping — advisory infrastructure
+    # gets bypassed (flotilla#812).
     if timeout < 300:
         print(f"Note: --timeout {int(timeout)}s raised to 300s — one call, one real wait", file=sys.stderr)
         timeout = 300
-    # Adaptive backoff: stay responsive early, decay toward a cap for long CI
-    # runs — fixed 30s polling across many concurrent shepherds was a main
-    # consumer of the shared 5k/hr GitHub rate limit (flotilla#885).
-    poll_cap = max(interval, 120)
-    deadline = time.time() + timeout
+    base_interval = args.interval
+    if base_interval < WAIT_BASE_INTERVAL:
+        print(f"Note: --interval {base_interval}s raised to {WAIT_BASE_INTERVAL}s", file=sys.stderr)
+        base_interval = WAIT_BASE_INTERVAL
+    # Gentle backoff: each poll that sees no change waits WAIT_BACKOFF times
+    # longer, up to the cap; any change (check states, head commit, merge
+    # state) resets to the base interval. Polls are REST only — three
+    # requests (PR, check runs, statuses) — and spend no GraphQL budget.
+    poll_cap = max(base_interval, WAIT_MAX_INTERVAL)
+    interval = base_interval
+    started_at = time.time()
+    deadline = started_at + timeout
     wait_start = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Resolve exclude authors for review checking
@@ -1377,8 +1663,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
         else:
             exclude_authors = {_get_current_user()}
 
-    poll_count = 0
-    meta = {}
+    previous_fingerprint = None
     # Expectation-first polling (flotilla#885): after confirming checks are
     # pending, sleep to ~90% of the learned expected CI duration before
     # entering the poll/backoff cadence — aim at the completion time instead
@@ -1386,16 +1671,22 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
     expected = _load_ci_ema()
     expectation_slept = False
     while True:
-        # Checks are the hot datum — fetch fresh every poll. PR metadata
-        # (mergeable state) changes rarely mid-wait; refresh it every 3rd
-        # poll to halve API traffic (flotilla#885).
+        # One REST read of the PR gives the head commit and mergeable state;
+        # the checks for that commit follow from it.
+        _invalidate_cache(f"pr_{pr}_meta*")
         _invalidate_cache(f"pr_{pr}_checks*")
+        meta = fetch_pr_metadata(pr)
         checks = fetch_pr_checks(pr)
-        if poll_count % 3 == 0:
-            _invalidate_cache(f"pr_{pr}_meta*")
-            meta = fetch_pr_metadata(pr)
-        poll_count += 1
         merge_state = meta.get("mergeable", "UNKNOWN")
+
+        fingerprint = (
+            meta.get("headRefOid"),
+            merge_state,
+            tuple(sorted((c.get("name", ""), c.get("state", "")) for c in checks)),
+        )
+        if previous_fingerprint is not None and fingerprint != previous_fingerprint:
+            interval = base_interval
+        previous_fingerprint = fingerprint
 
         # Conflicts block CI — exit early so the shepherd can resolve them
         if merge_state == "CONFLICTING":
@@ -1427,7 +1718,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
             print(f"Waiting... no checks registered yet, {int(remaining)}s remaining",
                   file=sys.stderr)
             time.sleep(min(interval, remaining))
-            interval = min(int(interval * 1.5), poll_cap)
+            interval = min(int(interval * WAIT_BACKOFF), poll_cap)
             continue
 
         pending = [c for c in checks if _classify_check(c) == "pending"]
@@ -1435,7 +1726,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
         if not pending:
             # All checks complete — build detailed result
             check_info = _summarize_checks(checks)
-            _record_ci_duration(time.time() - (deadline - timeout))
+            _record_ci_duration(time.time() - started_at)
             result = {
                 "done": True,
                 "merge_state": merge_state,
@@ -1446,7 +1737,8 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
                 "failed_checks": check_info["failed"],
             }
 
-            # Check for new reviews if requested
+            # New review activity, read from REST comment listings. Thread
+            # resolution (GraphQL) is not needed to report new comments.
             if args.check_reviews:
                 repo = _get_repo()
                 result["new_reviews"] = _check_new_reviews(
@@ -1483,7 +1775,11 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
             expectation_slept = True
             # Anchor on the CI run's actual start so repeated short-timeout
             # invocations still converge on the expected completion time.
-            started = [c.get("startedAt") for c in checks if c.get("startedAt")]
+            # Statuses carry no start time (gh's zero time); skip them.
+            started = [
+                c.get("startedAt") for c in checks
+                if c.get("startedAt") and c.get("startedAt") != ZERO_TIME
+            ]
             try:
                 earliest = min(
                     datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
@@ -1491,7 +1787,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
                 )
                 elapsed = time.time() - earliest
             except ValueError:
-                elapsed = time.time() - (deadline - timeout)
+                elapsed = time.time() - started_at
             if timeout < 0.5 * expected:
                 print(f"Note: expected CI duration ~{int(expected)}s for this repo; "
                       f"--timeout {int(timeout)}s will return before completion — "
@@ -1504,7 +1800,7 @@ def cmd_wait_for_checks(args: argparse.Namespace) -> None:
                 time.sleep(min(head_start, remaining))
                 continue
         time.sleep(min(interval, remaining))
-        interval = min(int(interval * 1.5), poll_cap)
+        interval = min(int(interval * WAIT_BACKOFF), poll_cap)
 
 
 def cmd_new_reviews(args: argparse.Namespace) -> None:
@@ -1752,9 +2048,11 @@ def main() -> None:
                             help="Poll until checks complete (conflict + review detection)")
     p_wait.add_argument("pr_number", type=int, help="PR number")
     p_wait.add_argument("--timeout", type=int, default=900,
-                        help="Timeout in seconds (default: 900)")
-    # Accepted only so stale caller habits don't crash; ignored and hidden.
-    p_wait.add_argument("--interval", type=int, default=30, help=argparse.SUPPRESS)
+                        help="Timeout in seconds (default: 900; minimum 300)")
+    p_wait.add_argument("--interval", type=int, default=WAIT_BASE_INTERVAL,
+                        help=f"Base poll interval in seconds (default and minimum: "
+                             f"{WAIT_BASE_INTERVAL}); backs off x{WAIT_BACKOFF} while "
+                             f"nothing changes, up to {WAIT_MAX_INTERVAL}")
     p_wait.add_argument("--check-reviews", action="store_true",
                         help="After checks complete, check for new review comments")
     p_wait.add_argument("--exclude-author", dest="exclude_authors", action="append",

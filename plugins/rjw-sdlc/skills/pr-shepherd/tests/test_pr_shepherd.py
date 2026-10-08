@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import argparse
+import contextlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -8,12 +12,15 @@ import sys
 import tempfile
 import textwrap
 import time
+from types import ModuleType
 from typing import ClassVar
 import unittest
+from unittest import mock
 from urllib.parse import quote
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "pr-shepherd.py"
+FIXTURE_DIR = Path(__file__).parent / "fixtures"
 ADDRESSING_LABEL = "shepherd: addressing"
 
 
@@ -42,7 +49,12 @@ class CliHarness(unittest.TestCase):
                 with Path(os.environ["FAKE_GH_LOG"]).open("a") as log:
                     log.write(json.dumps(args) + "\\n")
 
-                if args[:2] == ["api", "graphql"]:
+                if args[:1] == ["pr"]:
+                    # `gh pr view` / `gh pr checks` spend the shared GraphQL
+                    # budget; the helper reads through REST instead.
+                    print("fake gh: GraphQL-backed `gh pr` command refused", file=sys.stderr)
+                    sys.exit(3)
+                elif args[:2] == ["api", "graphql"]:
                     print(os.environ.get(
                         "FAKE_GH_REVIEW_THREADS",
                         json.dumps({"data": {"repository": {"pullRequest": {
@@ -50,13 +62,6 @@ class CliHarness(unittest.TestCase):
                     ))
                 elif args[:2] == ["repo", "view"]:
                     print("owner/repo")
-                elif args[:2] == ["pr", "view"]:
-                    if args[2:] == ["--json", "number", "--jq", ".number"]:
-                        print(os.environ.get("FAKE_GH_DETECTED_PR", ""))
-                    else:
-                        print(os.environ.get("FAKE_GH_PR_METADATA", "{}"))
-                elif args[:2] == ["pr", "checks"]:
-                    print(os.environ.get("FAKE_GH_CHECKS", "[]"))
                 elif (args and args[0] == "api" and "-X" in args and "DELETE" in args
                       and "/issues/" in args[1] and "/labels/" in args[1]):
                     # Removing a label from the PR. 404 when it isn't applied.
@@ -93,9 +98,29 @@ class CliHarness(unittest.TestCase):
                             print("gh: Not Found (HTTP 404)", file=sys.stderr)
                             sys.exit(1)
                     elif endpoint.rstrip("0123456789").endswith("/pulls/"):
-                        value = os.environ.get(
-                            "FAKE_GH_PULL", json.dumps({"user": {"login": "author", "id": 1}})
-                        )
+                        value = os.environ.get("FAKE_GH_PULL") or json.dumps({
+                            "number": int(endpoint.rsplit("/", 1)[1]),
+                            "title": "Shepherded PR",
+                            "user": {"login": "author", "id": 1, "type": "User"},
+                            "state": "open",
+                            "head": {"ref": "shepherded", "sha": "headsha"},
+                            "base": {"ref": "main"},
+                            "mergeable": True,
+                        })
+                    elif "/pulls?" in endpoint and "head=" in endpoint:
+                        value = os.environ.get("FAKE_GH_HEAD_PULLS", "[]")
+                    elif "/check-runs?" in endpoint or (
+                            "/commits/" in endpoint and "/status?" in endpoint):
+                        key, var = (("check_runs", "FAKE_GH_CHECK_RUNS")
+                                    if "/check-runs?" in endpoint
+                                    else ("statuses", "FAKE_GH_STATUSES"))
+                        items = json.loads(os.environ.get(var, "[]"))
+                        page = int(endpoint.rsplit("&page=", 1)[1])
+                        value = json.dumps({"total_count": len(items),
+                                            key: items[(page - 1) * 100:page * 100]})
+                    elif "/actions/runs?" in endpoint:
+                        runs = json.loads(os.environ.get("FAKE_GH_WORKFLOW_RUNS", "[]"))
+                        value = json.dumps({"total_count": len(runs), "workflow_runs": runs})
                     elif "/pulls/" in endpoint and endpoint.endswith("/reviews?per_page=100"):
                         value = os.environ.get("FAKE_GH_REVIEWS", "[]")
                     elif "/pulls/" in endpoint and endpoint.endswith("/comments?per_page=100"):
@@ -118,6 +143,18 @@ class CliHarness(unittest.TestCase):
         # Tests run inside flotilla crews too; standalone is the default here.
         self.env.pop("FLOTILLA_CREW_ID", None)
         self.env.pop("PR_SHEPHERD_AS", None)
+        self.env.pop("GH_HOST", None)
+
+        # The helper runs inside a checkout of owner/repo on branch
+        # `shepherded`; it reads the repository from the git remote.
+        self.checkout = self.root / "checkout"
+        self.checkout.mkdir()
+        self.git("init", "-q", "-b", "shepherded")
+        self.git("remote", "add", "origin", "git@github.com:owner/repo.git")
+
+    def git(self, *args: str) -> None:
+        subprocess.run(["git", "-C", str(self.checkout), *args], check=True,
+                       capture_output=True)
 
     def run_cli(
         self, *args: str, input_text: str | None = None
@@ -128,6 +165,7 @@ class CliHarness(unittest.TestCase):
             capture_output=True,
             text=True,
             env=self.env,
+            cwd=self.checkout,
             timeout=10,
         )
 
@@ -143,24 +181,48 @@ class CliHarness(unittest.TestCase):
             if any(arg.startswith("body=") for arg in call)
         )
 
-    def pr_metadata(self, author_login: str) -> str:
-        return json.dumps(
-            {
-                "number": self.pr_number,
-                "title": "Shepherded PR",
-                "body": "",
-                "author": {"login": author_login},
-                "state": "OPEN",
-                "isDraft": False,
-                "baseRefName": "main",
-                "headRefName": "shepherded",
-                "mergeable": "MERGEABLE",
-                "url": "https://example.test/pr/shepherded",
-                "additions": 1,
-                "deletions": 0,
-                "changedFiles": 1,
-            }
-        )
+    def pull(self, author_login: str = "author", **fields: object) -> str:
+        """The PR as `GET /repos/{o}/{r}/pulls/{n}` returns it."""
+        pull = {
+            "number": self.pr_number,
+            "title": "Shepherded PR",
+            "body": "",
+            "user": {"login": author_login, "id": 1, "type": "User"},
+            "state": "open",
+            "merged": False,
+            "draft": False,
+            "base": {"ref": "main"},
+            "head": {"ref": "shepherded", "sha": "headsha"},
+            "mergeable": True,
+            "html_url": "https://example.test/pr/shepherded",
+            "additions": 1,
+            "deletions": 0,
+            "changed_files": 1,
+            "labels": [],
+        }
+        pull.update(fields)
+        return json.dumps(pull)
+
+    @staticmethod
+    def check_run(name: str, conclusion: str | None, run_id: int = 1) -> dict:
+        """A REST check run; conclusion None means still in progress."""
+        return {
+            "id": run_id,
+            "name": name,
+            "status": "completed" if conclusion else "in_progress",
+            "conclusion": conclusion,
+            "started_at": "2026-07-18T10:00:00Z",
+            "completed_at": "2026-07-18T10:05:00Z" if conclusion else None,
+            "details_url": f"https://github.com/owner/repo/actions/runs/{900 + run_id}/job/{run_id}",
+            "check_suite": {"id": 1},
+        }
+
+    def graphql_calls(self) -> list[list[str]]:
+        """gh invocations that spend the GraphQL budget."""
+        return [
+            c for c in self.gh_calls()
+            if c[:2] == ["api", "graphql"] or c[:1] == ["pr"] or c[:2] == ["repo", "view"]
+        ]
 
 
 class PrShepherdCliTest(CliHarness):
@@ -259,28 +321,12 @@ class PrShepherdCliTest(CliHarness):
         )
 
     def test_status_brief_returns_the_convergence_fields_without_raw_detail(self) -> None:
-        self.env["FAKE_GH_PR_METADATA"] = json.dumps(
-            {
-                "number": self.pr_number,
-                "title": "Make replies safe",
-                "body": "",
-                "author": {"login": "author"},
-                "state": "OPEN",
-                "isDraft": False,
-                "baseRefName": "main",
-                "headRefName": "safe-replies",
-                "mergeable": "MERGEABLE",
-                "url": "https://example.test/pr/42",
-                "additions": 12,
-                "deletions": 3,
-                "changedFiles": 2,
-            }
+        self.env["FAKE_GH_PULL"] = self.pull(
+            title="Make replies safe", head={"ref": "safe-replies", "sha": "headsha"},
+            html_url="https://example.test/pr/42",
         )
-        self.env["FAKE_GH_CHECKS"] = json.dumps(
-            [
-                {"name": "test", "bucket": "pass", "link": ""},
-                {"name": "review", "bucket": "pending", "link": ""},
-            ]
+        self.env["FAKE_GH_CHECK_RUNS"] = json.dumps(
+            [self.check_run("test", "success", 1), self.check_run("review", None, 2)]
         )
 
         result = self.run_cli("status", str(self.pr_number), "--brief")
@@ -312,47 +358,33 @@ class PrShepherdCliTest(CliHarness):
         )
 
     def test_status_detects_the_current_branch_pr_when_number_is_omitted(self) -> None:
-        self.env["FAKE_GH_DETECTED_PR"] = str(self.pr_number)
-        self.env["FAKE_GH_PR_METADATA"] = json.dumps(
-            {
-                "number": self.pr_number,
-                "title": "Detected PR",
-                "body": "",
-                "author": {"login": "author"},
-                "state": "OPEN",
-                "isDraft": False,
-                "baseRefName": "main",
-                "headRefName": "detected",
-                "mergeable": "MERGEABLE",
-                "url": "https://example.test/pr/detected",
-                "additions": 0,
-                "deletions": 0,
-                "changedFiles": 0,
-            }
+        self.env["FAKE_GH_HEAD_PULLS"] = json.dumps([{"number": self.pr_number}])
+        self.env["FAKE_GH_PULL"] = self.pull(
+            title="Detected PR", head={"ref": "shepherded", "sha": "headsha"},
+            html_url="https://example.test/pr/detected",
         )
 
         result = self.run_cli("status", "--brief")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["pr"]["number"], self.pr_number)
+        # The current branch's PR is found through REST, by head owner:branch.
+        self.assertIn(
+            "repos/owner/repo/pulls?head=owner%3Ashepherded&state=open&per_page=10",
+            [c[1] for c in self.gh_calls() if c[:1] == ["api"]],
+        )
+        self.assertEqual(self.graphql_calls(), [])
+
+    def test_status_reports_no_pr_when_the_branch_has_none(self) -> None:
+        result = self.run_cli("status", "--brief")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not detect a pull request", result.stderr)
 
     def test_status_does_not_reflag_an_issue_comment_with_an_address_marker(self) -> None:
-        self.env["FAKE_GH_PR_METADATA"] = json.dumps(
-            {
-                "number": self.pr_number,
-                "title": "Addressed review",
-                "body": "",
-                "author": {"login": "author"},
-                "state": "OPEN",
-                "isDraft": False,
-                "baseRefName": "main",
-                "headRefName": "addressed",
-                "mergeable": "MERGEABLE",
-                "url": "https://example.test/pr/addressed",
-                "additions": 1,
-                "deletions": 0,
-                "changedFiles": 1,
-            }
+        self.env["FAKE_GH_PULL"] = self.pull(
+            title="Addressed review", head={"ref": "addressed", "sha": "headsha"},
+            html_url="https://example.test/pr/addressed",
         )
         self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
             [
@@ -383,22 +415,9 @@ class PrShepherdCliTest(CliHarness):
         self.assertEqual(status["action_items"], [])
 
     def test_status_ignores_only_unambiguously_approving_bot_comments(self) -> None:
-        self.env["FAKE_GH_PR_METADATA"] = json.dumps(
-            {
-                "number": self.pr_number,
-                "title": "Bot approval",
-                "body": "",
-                "author": {"login": "author"},
-                "state": "OPEN",
-                "isDraft": False,
-                "baseRefName": "main",
-                "headRefName": "approved",
-                "mergeable": "MERGEABLE",
-                "url": "https://example.test/pr/approved",
-                "additions": 1,
-                "deletions": 0,
-                "changedFiles": 1,
-            }
+        self.env["FAKE_GH_PULL"] = self.pull(
+            title="Bot approval", head={"ref": "approved", "sha": "headsha"},
+            html_url="https://example.test/pr/approved",
         )
         self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
             [
@@ -443,22 +462,9 @@ class PrShepherdCliTest(CliHarness):
         )
 
     def test_status_uses_the_reviewers_latest_state(self) -> None:
-        self.env["FAKE_GH_PR_METADATA"] = json.dumps(
-            {
-                "number": self.pr_number,
-                "title": "Latest review state",
-                "body": "",
-                "author": {"login": "author"},
-                "state": "OPEN",
-                "isDraft": False,
-                "baseRefName": "main",
-                "headRefName": "latest-review",
-                "mergeable": "MERGEABLE",
-                "url": "https://example.test/pr/latest-review",
-                "additions": 1,
-                "deletions": 0,
-                "changedFiles": 1,
-            }
+        self.env["FAKE_GH_PULL"] = self.pull(
+            title="Latest review state", head={"ref": "latest-review", "sha": "headsha"},
+            html_url="https://example.test/pr/latest-review",
         )
         self.env["FAKE_GH_REVIEWS"] = json.dumps(
             [
@@ -487,22 +493,9 @@ class PrShepherdCliTest(CliHarness):
         self.assertEqual(reviews["changes_requested"], 0)
 
     def test_status_treats_an_approving_inline_reply_as_resolved(self) -> None:
-        self.env["FAKE_GH_PR_METADATA"] = json.dumps(
-            {
-                "number": self.pr_number,
-                "title": "Inline approval",
-                "body": "",
-                "author": {"login": "author"},
-                "state": "OPEN",
-                "isDraft": False,
-                "baseRefName": "main",
-                "headRefName": "inline-approval",
-                "mergeable": "MERGEABLE",
-                "url": "https://example.test/pr/inline-approval",
-                "additions": 1,
-                "deletions": 0,
-                "changedFiles": 1,
-            }
+        self.env["FAKE_GH_PULL"] = self.pull(
+            title="Inline approval", head={"ref": "inline-approval", "sha": "headsha"},
+            html_url="https://example.test/pr/inline-approval",
         )
         self.env["FAKE_GH_REVIEW_COMMENTS"] = json.dumps(
             [
@@ -548,22 +541,9 @@ class PrShepherdCliTest(CliHarness):
         self.assertIn("default: 900", result.stdout)
 
     def test_reply_makes_its_address_marker_visible_to_the_next_status(self) -> None:
-        self.env["FAKE_GH_PR_METADATA"] = json.dumps(
-            {
-                "number": self.pr_number,
-                "title": "Fresh reply state",
-                "body": "",
-                "author": {"login": "author"},
-                "state": "OPEN",
-                "isDraft": False,
-                "baseRefName": "main",
-                "headRefName": "fresh-reply",
-                "mergeable": "MERGEABLE",
-                "url": "https://example.test/pr/fresh-reply",
-                "additions": 1,
-                "deletions": 0,
-                "changedFiles": 1,
-            }
+        self.env["FAKE_GH_PULL"] = self.pull(
+            title="Fresh reply state", head={"ref": "fresh-reply", "sha": "headsha"},
+            html_url="https://example.test/pr/fresh-reply",
         )
         review_comment = {
             "id": 9201,
@@ -606,9 +586,8 @@ class PrShepherdCliTest(CliHarness):
     def test_status_recognises_an_app_authors_own_replies(self) -> None:
         # gh renders an App author as "app/<slug>"; the REST API, which
         # authors every comment, calls the same account "<slug>[bot]".
-        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("app/flotilla-crew")
-        self.env["FAKE_GH_PULL"] = json.dumps(
-            {"user": {"login": "flotilla-crew[bot]", "id": 309902803}}
+        self.env["FAKE_GH_PULL"] = self.pull(
+            user={"login": "flotilla-crew[bot]", "id": 309902803, "type": "Bot"}
         )
         crew = {"login": "flotilla-crew[bot]", "id": 309902803}
         reviewer = {"login": "reviewer-bot", "id": 77}
@@ -640,7 +619,7 @@ class PrShepherdCliTest(CliHarness):
 
 
     def crew_shepherding_a_human_pr(self) -> None:
-        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        self.env["FAKE_GH_PULL"] = self.pull()
         self.env["FAKE_GH_USERS"] = json.dumps(
             {"flotilla-crew[bot]": {"login": "flotilla-crew[bot]", "id": 309902803}}
         )
@@ -709,7 +688,7 @@ class PerFindingTest(CliHarness):
 
     def setUp(self) -> None:
         super().setUp()
-        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        self.env["FAKE_GH_PULL"] = self.pull()
 
     def three_finding_review(self, *replies: dict) -> None:
         self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
@@ -892,7 +871,7 @@ class ActionableRuleTest(CliHarness):
 
     def setUp(self) -> None:
         super().setUp()
-        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        self.env["FAKE_GH_PULL"] = self.pull()
 
     def review(self, review_id: int, login: str, state: str, body: str, at: str,
                user_type: str = "User") -> dict:
@@ -968,12 +947,9 @@ class NoWaitTest(CliHarness):
 
     def setUp(self) -> None:
         super().setUp()
-        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
-        self.env["FAKE_GH_CHECKS"] = json.dumps(
-            [
-                {"name": "test", "bucket": "pass", "link": ""},
-                {"name": "review", "bucket": "pending", "link": ""},
-            ]
+        self.env["FAKE_GH_PULL"] = self.pull()
+        self.env["FAKE_GH_CHECK_RUNS"] = json.dumps(
+            [self.check_run("test", "success", 1), self.check_run("review", None, 2)]
         )
 
     def assert_one_snapshot(self, result: subprocess.CompletedProcess[str]) -> None:
@@ -983,8 +959,11 @@ class NoWaitTest(CliHarness):
         self.assertFalse(snapshot["done"])
         self.assertEqual(snapshot["pending_names"], ["review"])
         self.assertEqual(snapshot["passed"], 1)
-        checks_calls = [c for c in self.gh_calls() if c[:2] == ["pr", "checks"]]
-        self.assertEqual(len(checks_calls), 1)
+        check_run_reads = [
+            c for c in self.gh_calls() if c[:1] == ["api"] and "/check-runs?" in c[1]
+        ]
+        self.assertEqual(len(check_run_reads), 1)
+        self.assertEqual(self.graphql_calls(), [])
 
     def test_wait_for_checks_returns_one_snapshot_under_flotilla(self) -> None:
         self.env["FLOTILLA_CREW_ID"] = "crew-123"
@@ -1018,7 +997,7 @@ class AckClearTest(CliHarness):
 
     def setUp(self) -> None:
         super().setUp()
-        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        self.env["FAKE_GH_PULL"] = self.pull()
 
     def post_endpoints(self) -> list[str]:
         return [c[1] for c in self.gh_calls() if c[:1] == ["api"] and "POST" in c]
@@ -1151,14 +1130,12 @@ class AckClearTest(CliHarness):
         )
         # Distinct PR numbers so the per-PR metadata cache doesn't carry the
         # first probe's labels into the second.
-        meta = json.loads(self.pr_metadata("author"))
-        meta["labels"] = [{"name": ADDRESSING_LABEL}]
-        self.env["FAKE_GH_PR_METADATA"] = json.dumps(meta)
+        self.env["FAKE_GH_PULL"] = self.pull(labels=[{"name": ADDRESSING_LABEL}])
         with_label = json.loads(self.run_cli("status", str(self.pr_number)).stdout)
         self.assertTrue(with_label["addressing_label"])
         self.assertNotIn("addressing_label_cleared", with_label)
 
-        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        self.env["FAKE_GH_PULL"] = self.pull()
         without_label = json.loads(
             self.run_cli("status", str(self.pr_number + 1)).stdout
         )
@@ -1177,9 +1154,7 @@ class AutoClearConvergenceTest(CliHarness):
         super().setUp()
         # The PR carries the label, and the repo has it applied so a DELETE
         # succeeds rather than 404ing.
-        meta = json.loads(self.pr_metadata("author"))
-        meta["labels"] = self.LABELLED
-        self.env["FAKE_GH_PR_METADATA"] = json.dumps(meta)
+        self.env["FAKE_GH_PULL"] = self.pull(labels=self.LABELLED)
         self.env["FAKE_GH_APPLIED_LABELS"] = json.dumps([ADDRESSING_LABEL])
 
     def label_deletes(self) -> list[list[str]]:
@@ -1266,9 +1241,7 @@ class AutoClearConvergenceTest(CliHarness):
     def test_failing_checks_do_not_keep_the_label_set(self) -> None:
         # The label's claim is "unanswered review points remain", so review
         # convergence clears it even while checks still need fixing.
-        self.env["FAKE_GH_CHECKS"] = json.dumps(
-            [{"name": "test", "bucket": "fail", "link": ""}]
-        )
+        self.env["FAKE_GH_CHECK_RUNS"] = json.dumps([self.check_run("test", "failure")])
 
         result = self.run_cli("status", str(self.pr_number))
 
@@ -1281,7 +1254,7 @@ class AutoClearConvergenceTest(CliHarness):
     def test_nothing_breaks_when_the_label_is_absent(self) -> None:
         # No label on the PR: converged status and reply both no-op on the
         # label without erroring or issuing a DELETE.
-        self.env["FAKE_GH_PR_METADATA"] = self.pr_metadata("author")
+        self.env["FAKE_GH_PULL"] = self.pull()
         self.env["FAKE_GH_APPLIED_LABELS"] = json.dumps([])
         self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps([self.open_issue_comment(100)])
 
@@ -1297,6 +1270,248 @@ class AutoClearConvergenceTest(CliHarness):
         self.assertNotIn("addressing_label_cleared", json.loads(status.stdout))
         self.assertNotIn("addressing_label", json.loads(reply.stdout))
         self.assertEqual(self.label_deletes(), [])
+
+
+def load_helper() -> ModuleType:
+    """Import a fresh copy of the helper script (its filename has a hyphen)."""
+    spec = importlib.util.spec_from_file_location("pr_shepherd_under_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class RestParityTest(unittest.TestCase):
+    """REST answers must reproduce what the GraphQL-backed `gh pr checks` and
+    `gh pr view` reported. Each fixture directory holds trimmed REST
+    responses and gh's output for the same PR, recorded read-only at the
+    same moment: flotilla PRs (Actions jobs, a cancelled job, a job re-run
+    by review events, an App author, a merged PR) and a nodejs PR (legacy
+    commit statuses, in-progress runs, duplicate workflow runs)."""
+
+    FIXTURES = sorted(p for p in FIXTURE_DIR.iterdir() if p.is_dir())
+
+    def setUp(self) -> None:
+        self.helper = load_helper()
+
+    @staticmethod
+    def read(directory: Path, name: str) -> dict | list:
+        return json.loads((directory / f"{name}.json").read_text())
+
+    def test_check_rows_match_gh_pr_checks(self) -> None:
+        for directory in self.FIXTURES:
+            with self.subTest(fixture=directory.name):
+                expected = self.read(directory, "gh_pr_checks")
+                actual = self.helper._checks_from_rest(
+                    self.read(directory, "check_runs")["check_runs"],
+                    self.read(directory, "status")["statuses"],
+                    self.read(directory, "workflow_runs")["workflow_runs"],
+                )
+
+                def canonical(rows: list[dict]) -> list[str]:
+                    return sorted(json.dumps(row, sort_keys=True) for row in rows)
+
+                self.assertEqual(canonical(actual), canonical(expected))
+                # gh orders newest start first; among equal start times its
+                # order is unspecified, so only the start sequence is compared.
+                self.assertEqual(
+                    [row["startedAt"] for row in actual],
+                    [row["startedAt"] for row in expected],
+                )
+
+    def test_fixtures_cover_the_cases_that_need_care(self) -> None:
+        def states(name: str) -> set[str]:
+            rows = self.read(FIXTURE_DIR / name, "gh_pr_checks")
+            return {row["state"] for row in rows}
+
+        self.assertIn("CANCELLED", states("flotilla-org_flotilla_2891"))
+        node_statuses = self.read(FIXTURE_DIR / "nodejs_node_66601", "status")["statuses"]
+        self.assertTrue(node_statuses)
+        for name in ("flotilla-org_flotilla_2643", "nodejs_node_66601"):
+            runs = self.read(FIXTURE_DIR / name, "check_runs")["check_runs"]
+            names = [run["name"] for run in runs]
+            self.assertLess(len(set(names)), len(names), name)
+
+    def test_metadata_matches_gh_pr_view(self) -> None:
+        for directory in self.FIXTURES:
+            with self.subTest(fixture=directory.name):
+                expected = self.read(directory, "gh_pr_view")
+                actual = self.helper._meta_from_pull(self.read(directory, "pull"))
+                for field in (
+                    "number", "title", "body", "state", "isDraft", "baseRefName",
+                    "headRefName", "mergeable", "url", "createdAt", "updatedAt",
+                    "additions", "deletions", "changedFiles",
+                ):
+                    self.assertEqual(actual[field], expected[field], field)
+                self.assertEqual(actual["author"]["login"], expected["author"]["login"])
+                self.assertEqual(
+                    [label["name"] for label in actual["labels"]],
+                    [label["name"] for label in expected["labels"]],
+                )
+
+
+class GraphQLBudgetTest(CliHarness):
+    """Reads go through REST; GraphQL is reserved for thread resolution."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.env["FAKE_GH_PULL"] = self.pull()
+        self.env["FAKE_GH_CHECK_RUNS"] = json.dumps(
+            [self.check_run("test", "failure", 1), self.check_run("lint", "success", 2)]
+        )
+
+    def test_status_without_open_threads_spends_no_graphql(self) -> None:
+        self.env["FAKE_GH_ISSUE_COMMENTS"] = json.dumps(
+            [{"id": 100, "user": {"login": "reviewer"}, "body": "1. fix",
+              "created_at": "2026-07-18T10:00:00Z"}]
+        )
+
+        result = self.run_cli("status", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = json.loads(result.stdout)
+        self.assertEqual(status["checks"]["failed"], [{
+            "name": "test",
+            "link": "https://github.com/owner/repo/actions/runs/901/job/1",
+            "run_id": "901",
+        }])
+        self.assertEqual(self.graphql_calls(), [])
+
+    def test_status_with_an_open_thread_asks_graphql_once(self) -> None:
+        self.env["FAKE_GH_REVIEW_COMMENTS"] = json.dumps(
+            [{"id": 200, "user": {"login": "reviewer"}, "body": "rename this",
+              "created_at": "2026-07-18T10:00:00Z", "path": "a.py", "line": 3}]
+        )
+
+        result = self.run_cli("status", str(self.pr_number), "--brief")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["reviews"]["unresolved_threads"], 1)
+        self.assertEqual([c[:2] for c in self.graphql_calls()], [["api", "graphql"]])
+
+    def test_checks_merge_legacy_statuses_with_check_runs(self) -> None:
+        self.env["FAKE_GH_STATUSES"] = json.dumps(
+            [{"context": "ci/jenkins", "state": "failure", "description": "2 tests failed",
+              "target_url": "https://ci.example.test/job/7"}]
+        )
+
+        result = self.run_cli("checks", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertEqual(out["summary"], {"total": 3, "pass": 1, "fail": 2, "pending": 0, "skipped": 0})
+        jenkins = next(c for c in out["checks"] if c["name"] == "ci/jenkins")
+        self.assertEqual(jenkins["description"], "2 tests failed")
+        self.assertEqual(jenkins["link"], "https://ci.example.test/job/7")
+        self.assertEqual(self.graphql_calls(), [])
+
+    def test_check_runs_are_read_from_every_page(self) -> None:
+        runs = [self.check_run(f"job-{i}", "success", i) for i in range(1, 151)]
+        self.env["FAKE_GH_CHECK_RUNS"] = json.dumps(runs)
+
+        result = self.run_cli("checks", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["summary"]["pass"], 150)
+        pages = [c[1] for c in self.gh_calls() if "/check-runs?" in c[1]]
+        self.assertEqual(pages, ["repos/owner/repo/commits/headsha/check-runs?per_page=100&page=1",
+                                 "repos/owner/repo/commits/headsha/check-runs?per_page=100&page=2"])
+
+    def test_repo_comes_from_the_git_remote_without_gh_repo_view(self) -> None:
+        self.git("remote", "set-url", "origin", "https://github.com/someone/elsewhere.git")
+        self.git("remote", "add", "upstream", "git@github.com:owner/repo.git")
+
+        result = self.run_cli("checks", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"repos/owner/repo/pulls/{self.pr_number}",
+                      [c[1] for c in self.gh_calls() if c[:1] == ["api"]])
+        self.assertNotIn(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+                         self.gh_calls())
+
+    def test_repo_falls_back_to_gh_when_no_remote_is_on_github(self) -> None:
+        self.git("remote", "set-url", "origin", "https://forgejo.example.test/owner/repo.git")
+
+        result = self.run_cli("checks", str(self.pr_number))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+                      self.gh_calls())
+
+
+class WaitPacingTest(CliHarness):
+    """wait-for-checks polls REST every 60s, backs off x1.5 to 180s while
+    nothing changes, and resets when something does. Runs in-process on a
+    fake clock."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.env["FAKE_GH_PULL"] = self.pull()
+        self.helper = load_helper()
+        self.helper.CACHE_DIR = self.root / "cache"  # no learned CI duration
+        self.helper._repo_cache = "owner/repo"
+        self.now = 1_000_000.0
+        self.sleeps: list[float] = []
+        # After the Nth sleep, these check runs are what GitHub reports.
+        self.timeline: dict[int, list[dict]] = {}
+
+    def fake_sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+        if len(self.sleeps) in self.timeline:
+            os.environ["FAKE_GH_CHECK_RUNS"] = json.dumps(self.timeline[len(self.sleeps)])
+
+    def wait(self, interval: int = 60, timeout: int = 900) -> dict:
+        args = argparse.Namespace(
+            pr_number=self.pr_number, timeout=timeout, interval=interval,
+            check_reviews=False, exclude_authors=None, no_wait=False,
+        )
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+                mock.patch.object(self.helper.time, "sleep", self.fake_sleep), \
+                mock.patch.object(self.helper.time, "time", lambda: self.now), \
+                mock.patch.object(self.helper, "_load_ci_ema", lambda: None), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.helper.cmd_wait_for_checks(args)
+        return json.loads(out.getvalue())
+
+    def test_backs_off_while_unchanged_and_resets_on_change(self) -> None:
+        build, lint = 1, 2
+        self.env["FAKE_GH_CHECK_RUNS"] = json.dumps(
+            [self.check_run("build", None, build), self.check_run("lint", None, lint)]
+        )
+        self.timeline = {
+            4: [self.check_run("build", "success", build), self.check_run("lint", None, lint)],
+            5: [self.check_run("build", "success", build), self.check_run("lint", "failure", lint)],
+        }
+
+        result = self.wait()
+
+        self.assertEqual(self.sleeps, [60, 90, 135, 180, 60])
+        self.assertTrue(result["done"])
+        self.assertEqual(result["failed_checks"][0]["run_id"], "902")
+        self.assertEqual(self.graphql_calls(), [])
+
+    def test_interval_can_raise_the_base_but_not_lower_it(self) -> None:
+        self.env["FAKE_GH_CHECK_RUNS"] = json.dumps([self.check_run("build", None)])
+        self.timeline = {3: [self.check_run("build", "success")]}
+
+        self.wait(interval=10)
+        lowered = self.sleeps
+        self.sleeps = []
+        self.env["FAKE_GH_CHECK_RUNS"] = json.dumps([self.check_run("build", None)])
+        self.wait(interval=200)
+
+        self.assertEqual(lowered, [60, 90, 135])
+        self.assertEqual(self.sleeps, [200, 200, 200])
+
+    def test_times_out_after_the_requested_window(self) -> None:
+        self.env["FAKE_GH_CHECK_RUNS"] = json.dumps([self.check_run("build", None)])
+
+        with self.assertRaises(SystemExit):
+            self.wait(timeout=300)
+
+        self.assertEqual(sum(self.sleeps), 300)
 
 
 if __name__ == "__main__":

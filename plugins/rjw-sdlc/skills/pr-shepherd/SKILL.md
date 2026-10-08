@@ -211,7 +211,9 @@ After pushing changes, wait for both checks and new reviews:
 scripts/pr-shepherd.py wait-for-checks "$PR_NUMBER" --check-reviews
 ```
 
-The tool owns its pacing. The default timeout is 900 seconds, and shorter timeouts are raised to 300 so that one call is one real wait. It chooses its own poll interval and ignores `--interval`. Make one call and act on its result. Don't loop on short waits.
+The tool owns its pacing. The default timeout is 900 seconds, and shorter timeouts are raised to 300 so that one call is one real wait. It polls every 60 seconds, backing off ×1.5 up to 180 seconds while nothing changes; `--interval` can raise the 60-second base but not lower it. Make one call and act on its result. Don't loop on short waits.
+
+**Polling uses REST.** The helper reads PRs, checks, reviews and comments through the REST API. The GraphQL budget (5,000 points an hour) is shared by every `gh` command and every agent session on the machine, so in agent loops use `wait-for-checks` and `status --brief` rather than `gh pr checks --watch` or repeated `gh pr view`, both of which spend it. The helper's one GraphQL query reads review-thread resolution; `status` runs it only when an inline thread would otherwise be open, and `wait-for-checks` never runs it.
 
 The result includes conflicts, failed checks with `run_id`, and `new_reviews.count`. Reassess when checks fail, conflicts appear, or new reviews arrive. A wait timeout means “not finished yet,” not “failed.”
 
