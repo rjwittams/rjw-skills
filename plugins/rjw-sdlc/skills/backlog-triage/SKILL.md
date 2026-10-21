@@ -60,10 +60,11 @@ Some outcomes take the issue out of triage instead of labelling it:
 - **mission:** an umbrella tracker with a destination becomes a wayfinder mission (see Scope).
 - **park:** an idea or direction that needs a grill, a brainstorm or a prototype before anyone can judge it. The issue becomes a `Brainstorm` (ideation, out of scope) and loses its `triage:*` label. Record the direction you found in the summary so the grill starts from it.
 
-Two annotations go on any state:
+Three annotations go on any state:
 
 - **`split`:** the issue is startable, but too big for one convoy. The contract step should cut it into child issues.
-- **`needs`:** dispatch constraints, such as a Windows runner, a quiet merge window, the owner's machine or a live reproduction. They come from the repo's vocabulary (see [SETUP.md](SETUP.md)) and become `needs:<x>` labels, so placement can match them later.
+- **`needs`:** placement constraints a dispatcher matches against hosts, such as a Windows runner or a GPU. They become `needs:<x>` labels, which dispatchers parse, so they must come from the vocabulary in the repo's triage config (see [SETUP.md](SETUP.md)). A repo without one gets no `needs`.
+- **`conditions`:** constraints only a person can honour, such as a quiet merge window, an operator check after a deploy, the owner's machine or a live reproduction. They are free text in the record comment, never labels.
 
 **Never apply `ready`.** `ready` means the body alone is a dispatchable contract, and it is earned by rewriting the body, not by assessment. Triage's `triage:clear` is the queue that feeds the contract step.
 
@@ -105,7 +106,7 @@ scripts/backlog-triage.py apply plan.json --yes --only 1,2,5
 - native blocked-by edges not already present (a blocker that has already closed is reported, not linked);
 - sub-issue links and new issues;
 - the label change, removing any other `triage:*` label;
-- `needs:*` labels set to exactly the verdict's list;
+- `needs:*` labels set to exactly the verdict's list, when the repo declares a needs vocabulary (without one, `plan` rejects any `needs` and leaves existing `needs:*` labels alone);
 - the record comment, written once per issue and updated in place;
 - a type, if the issue has none or becomes a mission;
 - or, for a closure or park, the closure or the Brainstorm type.
