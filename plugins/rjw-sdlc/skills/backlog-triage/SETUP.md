@@ -28,12 +28,24 @@ name = "recording"
 description = "Recording and replay of sessions: asciicast output, transcripts, retention."
 paths = ["crates/cleat/src/recording.rs", "crates/cleat/src/replay.rs"]
 
-[needs]                  # dispatch-constraint vocabulary; each becomes a needs:<slug> label
-windows = "Needs a Windows host or runner to build or verify"
-quiet-window = "Touches so much that it must merge alone, in a quiet window"
+# The label format the repo's dispatcher parses. Required when [needs] is present.
+needs_label_pattern = "^needs:[a-z0-9-]+:[a-z0-9.-]+$"
+
+[needs]                  # placement vocabulary; each becomes a needs:<need> label
+"platform:windows" = "Needs a Windows host or runner to build or verify"
+"hardware:gpu" = "Needs a GPU"
 ```
 
-`setup --config` proposes the `needs:*` labels; `plan --config` rejects `needs` values outside the vocabulary.
+(`needs_label_pattern` is a top-level key, so it goes above the first table.)
+
+`needs` are **placement constraints**: things a dispatcher matches against a host or runner. A `needs:*` label is machine input, so the skill writes only labels the repo's config declares, and only in the format the repo's dispatcher reads:
+
+- Copy the vocabulary from the dispatcher's own capability list, not from this example or from `needs:*` labels already in the repo. Write the pattern to match what the dispatcher parses.
+- `load_config` refuses a `[needs]` table without `needs_label_pattern`, and any entry whose label doesn't match it.
+- `plan` rejects any `needs` value outside the vocabulary. A repo with no `[needs]` table has an empty vocabulary: every `needs` value is rejected, and `plan` leaves the repo's existing `needs:*` labels alone.
+- `setup --config` proposes the declared labels and reports `undeclared_needs_labels`: existing `needs:*` labels outside the vocabulary, with their open-issue counts and whether they match the pattern. Renaming or deleting those is a person's call.
+
+**Constraints for people are not needs.** A quiet merge window, a check the operator runs after a deploy, the owner's machine, a live reproduction someone has to catch: no dispatcher can match these to a host. They go in the verdict's `conditions` and appear in the record comment, never on a label.
 
 ## Issue types
 
@@ -42,7 +54,7 @@ Org-level: `Task`, `Bug`, `Feature`, `Brainstorm`, `Mission`, `Lane`. Assessment
 ## Each repo also needs
 
 - **Native issue dependencies and sub-issues** enabled. They are on for GitHub organisations by default.
-- **`docs/agents/triage.toml`**: components and needs vocabulary (above).
+- **`docs/agents/triage.toml`**: components, and the needs vocabulary with its label pattern if the repo's dispatcher reads `needs:*` labels (above).
 - **`docs/agents/triage-labels.md`** mapping the triage roles to label strings, as flotilla has, so skills that speak in roles find the labels.
 - **A token** that can label, comment and add dependencies, for whoever applies plans. Investigators need read access only.
 

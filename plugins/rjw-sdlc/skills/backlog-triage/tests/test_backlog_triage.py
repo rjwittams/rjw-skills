@@ -273,6 +273,36 @@ class OutcomeTests(unittest.TestCase):
         plan = self.plan([{"ref": "o/r#5", "state": "clear", "summary": "s", "needs": ["gpu"]}], vocab={"windows"})
         self.assertIn("not in the repo's vocabulary", plan["errors"][0]["errors"][0])
 
+    def test_without_a_vocabulary_no_needs_label_is_written(self):
+        plan = self.plan([{"ref": "o/r#5", "state": "clear", "summary": "s", "needs": ["quiet-window"]},
+                          {"ref": "o/r#9", "state": "wontfix", "summary": "s",
+                           "new_issues": [{"title": "t", "body": "b", "needs": ["multi-host"]}]}])
+        self.assertEqual(plan["actions"], [])
+        errs = [e for x in plan["errors"] for e in x["errors"]]
+        self.assertTrue(all("declares no [needs] vocabulary" in e and "conditions" in e for e in errs), errs)
+        self.assertEqual(len(errs), 2)
+
+    def test_without_a_vocabulary_existing_needs_labels_are_left_alone(self):
+        plan = self.plan([{"ref": "o/r#5", "state": "clear", "summary": "s"}])
+        self.assertNotIn("needs", [a["op"] for a in plan["actions"]])
+
+    def test_conditions_go_in_the_record_not_on_a_label(self):
+        plan = self.plan([{"ref": "o/r#7", "state": "clear", "summary": "s",
+                           "conditions": ["merge alone in a quiet window", "operator checks the fleet after the roll"]}])
+        self.assertEqual([a["op"] for a in plan["actions"]], ["label", "record"])
+        body = plan["actions"][1]["body"]
+        self.assertIn("- operator checks the fleet after the roll", body)
+        self.assertNotIn("needs:", body)
+        self.assertIn("conditions:", bt.review(plan))
+        self.assertIn("conditions must be", self.plan([{"ref": "o/r#7", "state": "clear", "conditions": [""]}])
+                      ["errors"][0]["errors"][0])
+
+    def test_namespaced_vocabulary_is_written_as_labels(self):
+        plan = self.plan([{"ref": "o/r#5", "state": "clear", "summary": "s", "needs": ["platform:windows"]}],
+                         vocab={"platform:windows"})
+        self.assertEqual(plan["errors"], [])
+        self.assertEqual([a["needs"] for a in plan["actions"] if a["op"] == "needs"], [["platform:windows"]])
+
     def test_needs_writer_sets_exact_labels(self):
         api = FakeApi(self.routes())
         bt.Writer(api, bt.Tracker(api)).run({"op": "needs", "ref": "o/r#5", "needs": ["windows"]})
@@ -320,6 +350,46 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(r["untyped_open_issues"], 1)
         self.assertEqual(r["missing_issue_types"], ["Lane"])
         self.assertEqual(d["actions"][0]["op"], "create_label")
+
+    def test_reports_needs_labels_outside_the_vocabulary(self):
+        names = list(bt.CANONICAL) + ["needs:platform:windows", "needs:multi-host", "needs:platform:macos"]
+        routes = {f"repos/{REPO}/labels": [{"name": n} for n in names],
+                  "orgs/o/issue-types": [{"name": t} for t in bt.ISSUE_TYPES],
+                  f"repos/{REPO}/issues": [issue(REPO, 1, labels=["needs:multi-host"], type_="Task")]}
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Path(d) / "triage.toml"
+            cfg.write_text(ConfigTests.PATTERN + '[needs]\n"platform:windows" = "w"\n')
+            _, out = run(["setup", REPO, "--config", str(cfg)], FakeApi(routes))
+        d = json.loads(out)
+        self.assertEqual(d["repos"][REPO]["undeclared_needs_labels"], {
+            "needs:multi-host": {"open_issues": 1, "matches_format": False},
+            "needs:platform:macos": {"open_issues": 0, "matches_format": True}})
+        self.assertEqual(d["actions"], [])
+
+
+class ConfigTests(unittest.TestCase):
+    PATTERN = 'needs_label_pattern = "^needs:[a-z0-9-]+:[a-z0-9.-]+$"\n'
+
+    def load(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "triage.toml"
+            p.write_text(text)
+            return bt.load_config(p)
+
+    def test_vocabulary_requires_a_label_pattern(self):
+        with self.assertRaisesRegex(SystemExit, "requires needs_label_pattern"):
+            self.load('[needs]\nwindows = "w"\n')
+
+    def test_vocabulary_entry_must_match_the_pattern(self):
+        with self.assertRaisesRegex(SystemExit, "does not match needs_label_pattern"):
+            self.load(self.PATTERN + '[needs]\nmulti-host = "m"\n')
+
+    def test_matching_vocabulary_loads(self):
+        cfg = self.load(self.PATTERN + '[needs]\n"platform:windows" = "w"\n')
+        self.assertEqual(set(cfg["needs"]), {"platform:windows"})
+
+    def test_config_without_needs_needs_no_pattern(self):
+        self.assertIsNone(self.load('[[component]]\nname = "a"\n')["needs_label_re"])
 
 
 if __name__ == "__main__":

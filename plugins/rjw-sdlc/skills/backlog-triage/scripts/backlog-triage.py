@@ -24,7 +24,8 @@ Read subcommands:
 
 Plan subcommands:
     plan VERDICT.json...      Turn agents' verdicts into a numbered action plan (JSON);
-                              --config validates `needs` against the repo's vocabulary
+                              --config supplies the repo's `needs` vocabulary; without one,
+                              any `needs` value is rejected (use `conditions`)
     show PLAN.json            Print the plan as a numbered list
     review PLAN.json          The plan as grouped Markdown for approval: questions first,
                               then closures, new issues, edges, and each state
@@ -95,7 +96,9 @@ LEAVING = (PARK, MISSION)
 CLOSE_REASON = {"superseded": "duplicate", "done": "completed", "wontfix": "not_planned"}
 NEEDS_PREFIX = "needs:"
 NEEDS_COLOR = "BFD4F2"
-SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+# A need is the label suffix after `needs:`. It may be namespaced (`platform:windows`) or versioned
+# (`harness:codex>=1.2`); GitHub caps label names at 50 characters.
+NEED_RE = re.compile(r"^[a-z0-9][a-z0-9._+:>=-]{0,%d}$" % (49 - len("needs:")))
 
 RECORD_MARK = "<!-- backlog-triage:record v1 -->"
 DATA_RE = re.compile(r"<!-- backlog-triage:data (\{.*?\}) -->", re.S)
@@ -273,11 +276,13 @@ def render_record(v: dict, at: str) -> str:
         lines += ["", "**Split before dispatch:** too big for one convoy; the contract step should cut it into child issues."]
     if v.get("needs"):
         lines += ["", "**Needs:** " + ", ".join(f"`{NEEDS_PREFIX}{n}`" for n in v["needs"])]
+    if v.get("conditions"):
+        lines += ["", "**Conditions (for people, not placement):**"] + [f"- {c}" for c in v["conditions"]]
     if v.get("batching"):
         lines += ["", f"**Batching:** {v['batching']}"]
     data = {"v": 1, "state": state, "at": at, "commit": v.get("commit"), "owner": v.get("owner"),
             "blockers": [b["ref"] for b in v.get("blockers", [])], "paths": v.get("paths", []),
-            "needs": v.get("needs", []), "split": bool(v.get("split"))}
+            "needs": v.get("needs", []), "conditions": v.get("conditions", []), "split": bool(v.get("split"))}
     lines += ["", f"<!-- backlog-triage:data {json.dumps(data, separators=(',', ':'))} -->"]
     return "\n".join(lines)
 
@@ -537,7 +542,24 @@ def group_issues(issues: list[dict], answers: dict[str, dict], max_size: int, mi
 
 # ── plan / apply ───────────────────────────────────────────────────────
 
+def need_errors(needs, vocab: set[str], prefix: str = "") -> list[str]:
+    """`needs` become labels a dispatcher reads, so only the repo's declared vocabulary is allowed. Without one,
+    the skill writes no `needs:*` label at all: a human-only constraint goes in `conditions`."""
+    errs = []
+    for n in needs or []:
+        if not isinstance(n, str):
+            errs.append(f"{prefix}need {n!r} must be a string")
+        elif not vocab:
+            errs.append(f"{prefix}need {n!r} rejected: the repo declares no [needs] vocabulary in its triage config; "
+                        "record a human-only constraint in `conditions`, or declare the vocabulary (SETUP.md)")
+        elif n not in vocab:
+            errs.append(f"{prefix}need {n!r} is not in the repo's vocabulary {sorted(vocab)}; "
+                        "if it is for people rather than placement, put it in `conditions`")
+    return errs
+
+
 def validate_verdict(v: dict, needs_vocab: set[str] | None = None) -> list[str]:
+    needs_vocab = needs_vocab or set()
     errs = []
     if not REF_RE.match(str(v.get("ref", ""))):
         errs.append("ref must be owner/repo#N")
@@ -560,11 +582,9 @@ def validate_verdict(v: dict, needs_vocab: set[str] | None = None) -> list[str]:
         errs.append("commit must be a hex sha")
     if v.get("type") and v["type"] not in ISSUE_TYPES:
         errs.append(f"type must be one of {ISSUE_TYPES}")
-    for n in v.get("needs", []):
-        if not SLUG_RE.match(str(n)):
-            errs.append(f"need {n!r} must be a lowercase slug")
-        elif needs_vocab is not None and n not in needs_vocab:
-            errs.append(f"need {n!r} is not in the repo's vocabulary {sorted(needs_vocab)}")
+    errs += need_errors(v.get("needs"), needs_vocab)
+    if not all(isinstance(c, str) and c.strip() for c in v.get("conditions", [])):
+        errs.append("conditions must be non-empty strings")
     for r in v.get("sub_issues", []):
         if not REF_RE.match(str(r)):
             errs.append(f"sub-issue {r!r} is not owner/repo#N")
@@ -581,9 +601,7 @@ def validate_verdict(v: dict, needs_vocab: set[str] | None = None) -> list[str]:
             errs.append("new issue in needs-answer requires a question")
         if ni.get("state") == "waiting" and not ni.get("waiting_on"):
             errs.append("new issue in waiting requires waiting_on")
-        for n in ni.get("needs", []):
-            if needs_vocab is not None and n not in needs_vocab:
-                errs.append(f"new issue need {n!r} is not in the repo's vocabulary {sorted(needs_vocab)}")
+        errs += need_errors(ni.get("needs"), needs_vocab, "new issue ")
     return errs
 
 
@@ -598,7 +616,7 @@ def plan_from_verdicts(tr: Tracker, verdicts: list[dict], needs_vocab: set[str] 
         ref, state = v["ref"], v["state"]
         repo = split_ref(ref)[0]
         issue = tr.issue(ref)
-        kept[ref] = {k: v.get(k) for k in ("state", "summary", "question", "owner", "confidence", "needs", "split",
+        kept[ref] = {k: v.get(k) for k in ("state", "summary", "question", "owner", "confidence", "needs", "conditions", "split",
                                            "superseded_by", "waiting_on", "batching") if v.get(k)}
         kept[ref]["title"] = issue.get("title")
         for ni in v.get("new_issues", []):
@@ -613,6 +631,7 @@ def plan_from_verdicts(tr: Tracker, verdicts: list[dict], needs_vocab: set[str] 
                 a["record"] = render_record({"state": ni["state"], "summary": ni.get("summary", ""),
                                              "question": ni.get("question"), "owner": ni.get("owner"),
                                              "waiting_on": ni.get("waiting_on"), "needs": ni.get("needs", []),
+                                             "conditions": ni.get("conditions", []),
                                              "commit": v.get("commit")}, at)
             actions.append(a)
         if state in CLOSING:
@@ -652,7 +671,8 @@ def plan_from_verdicts(tr: Tracker, verdicts: list[dict], needs_vocab: set[str] 
         if triage_label(issue) != f"triage:{state}" or set(labels_of(issue)) & set(REPLACED_ROLES):
             actions.append({"op": "label", "ref": ref, "state": state, "why": v.get("summary", "")})
         have = sorted(l[len(NEEDS_PREFIX):] for l in labels_of(issue) if l.startswith(NEEDS_PREFIX))
-        if sorted(v.get("needs", [])) != have:
+        # Without a declared vocabulary the skill does not own the repo's needs:* labels, so it leaves them alone.
+        if needs_vocab and sorted(v.get("needs", [])) != have:
             actions.append({"op": "needs", "ref": ref, "needs": sorted(v.get("needs", [])), "why": "dispatch constraints"})
         actions.append({"op": "record", "ref": ref, "body": render_record(v, at), "why": f"record triage:{state}"})
         if v.get("type") and not type_of(issue) and v["type"] in ("Task", "Bug", "Feature"):
@@ -750,17 +770,30 @@ class Writer:
 
 
 def load_config(path: Path | None) -> dict:
-    """Per-repo triage config (TOML): [[component]] tables and a [needs] table of slug = description."""
+    """Per-repo triage config (TOML): [[component]] tables, a [needs] table of need = description, and
+    `needs_label_pattern`, the regex every `needs:<need>` label must match for the repo's dispatcher to read it.
+    A vocabulary without a pattern is refused: the skill can't know what the dispatcher parses."""
     if not path:
         return {}
     cfg = tomllib.loads(path.read_text())
-    for n in cfg.get("needs", {}):
-        if not SLUG_RE.match(n):
-            raise SystemExit(f"{path}: need {n!r} must be a lowercase slug")
+    needs = cfg.get("needs", {})
+    pattern = cfg.get("needs_label_pattern")
+    if needs and not pattern:
+        raise SystemExit(f"{path}: [needs] requires needs_label_pattern, the label format the repo's dispatcher reads")
+    try:
+        rx = re.compile(pattern) if pattern else None
+    except re.error as e:
+        raise SystemExit(f"{path}: needs_label_pattern is not a valid regex: {e}")
+    for n in needs:
+        if not NEED_RE.match(n):
+            raise SystemExit(f"{path}: need {n!r} must be lowercase, without spaces, and fit a 50-character label")
+        if not rx.fullmatch(NEEDS_PREFIX + n):
+            raise SystemExit(f"{path}: label {NEEDS_PREFIX + n!r} does not match needs_label_pattern {pattern!r}")
+    cfg["needs_label_re"] = rx
     return cfg
 
 
-def setup_report(api: Api, repos: list[str], needs: dict[str, str] | None = None) -> dict:
+def setup_report(api: Api, repos: list[str], needs: dict[str, str] | None = None, needs_re: re.Pattern | None = None) -> dict:
     out = {"repos": {}, "actions": []}
     orgs = {}
     for repo in repos:
@@ -777,7 +810,13 @@ def setup_report(api: Api, repos: list[str], needs: dict[str, str] | None = None
         issues = [i for i in api.pages(f"repos/{repo}/issues?state=open") if "pull_request" not in i]
         untyped = sum(1 for i in issues if not type_of(i))
         used = {n: sum(n in labels_of(i) for i in issues) for n in invalid_priority}
+        # needs:* labels a dispatcher may read but the vocabulary doesn't declare, or whose format it can't parse.
+        # Reported with their open-issue counts, never deleted: renaming or dropping one is a person's call.
+        foreign = sorted(n for n in names if n.startswith(NEEDS_PREFIX) and n not in wanted)
+        unreadable = {n: {"open_issues": sum(n in labels_of(i) for i in issues),
+                          "matches_format": bool(needs_re.fullmatch(n)) if needs_re else None} for n in foreign}
         out["repos"][repo] = {"missing_labels": missing, "invalid_priority_labels": used,
+                              "undeclared_needs_labels": unreadable,
                               "open_issues": len(issues), "untyped_open_issues": untyped,
                               "missing_issue_types": None if orgs[org] is None else [t for t in ISSUE_TYPES if t not in orgs[org]]}
         out["actions"] += [{"op": "create_label", "repo": repo, "name": n, "color": wanted[n][0],
@@ -817,7 +856,8 @@ def review(plan: dict) -> str:
         if rs:
             out += ["", f"## {state} ({len(rs)})", ""]
             for r, v in rs:
-                extra = (" · split" if v.get("split") else "") + (f" · needs {', '.join(v['needs'])}" if v.get("needs") else "")
+                extra = ((" · split" if v.get("split") else "") + (f" · needs {', '.join(v['needs'])}" if v.get("needs") else "")
+                         + (f" · conditions: {'; '.join(v['conditions'])}" if v.get("conditions") else ""))
                 out.append(f"- **{short(r)}** {v.get('title', '')} ({(v.get('confidence') or '?')[0]}{extra}): "
                            f"{v.get('summary', '')} _[{num(r)}]_")
     if plan.get("batching"):
@@ -868,7 +908,8 @@ def main(argv=None, api: Api | None = None) -> int:
     emit = lambda x: print(json.dumps(x, indent=1))  # noqa: E731
 
     if a.cmd == "setup":
-        emit(setup_report(api, repos_arg(a.repos), load_config(a.config).get("needs")))
+        cfg = load_config(a.config)
+        emit(setup_report(api, repos_arg(a.repos), cfg.get("needs"), cfg.get("needs_label_re")))
     elif a.cmd == "scope":
         rows = scope_rows(tr, repos_arg(a.repos), a.include_ideation, a.include_missions)
         emit([r for r in rows if not (a.untriaged and r["triage"])])
@@ -917,7 +958,7 @@ def main(argv=None, api: Api | None = None) -> int:
                 batching[d["group"]] = d["batching"]
             verdicts += d if isinstance(d, list) else d.get("verdicts", [d])
         cfg = load_config(a.config)
-        emit(plan_from_verdicts(tr, verdicts, set(cfg["needs"]) if "needs" in cfg else None, batching))
+        emit(plan_from_verdicts(tr, verdicts, set(cfg.get("needs", {})), batching))
     elif a.cmd == "review":
         print(review(json.loads(a.plan.read_text())), end="")
     elif a.cmd == "show":
