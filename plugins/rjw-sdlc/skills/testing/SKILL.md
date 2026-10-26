@@ -1,6 +1,6 @@
 ---
 name: testing
-description: Use when writing or changing tests, or implementing a feature or fix that needs tests. State the intended behaviour first, choose the test scale (Hegel property and scenario tests by default), use real collaborators or fakes, cover edge cases, and prove the tests can fail with a mutation check before the PR. For autonomous crews: decide and record in the ledger.
+description: Use when writing or changing tests, or implementing a feature or fix that needs tests. State the intended behaviour first, choose the test scale (Hegel property and scenario tests by default), use real collaborators or fakes, cover edge cases, prove each behaviour once (delete the tests a new one makes redundant), and prove the tests can fail with a mutation check before the PR. For autonomous crews: decide and record in the ledger.
 ---
 
 # Testing
@@ -36,15 +36,25 @@ Cover, as named cases or through generator coverage: **empty, boundary (min, max
 
 Assert on observable behaviour through the public interface: return values, emitted events, stored state read back through its API, refusals and errors. Assert on an exact serialized layout when the layout **is** the contract, as with flotilla's golden stored-record corpus (#2169).
 
-## 6. Mutation check (before the PR)
+## 6. One test per behaviour
+
+A behaviour is proved **once**, at the scale where that's cheapest. Extra tests that prove the same thing again cost compile time, CI time and every later refactor, and they catch nothing new.
+
+- **Look before you add.** Search the existing tests for the behaviour first. Extend or strengthen an existing test in place of writing a parallel one.
+- **Delete what you supersede.** When a new property or scenario covers what older example tests checked, delete or merge the older tests in the same PR, and name them in the PR body.
+- **Don't assert restated constants.** Leave out tests that assert a literal path, a constant's value, a log or error message's wording, or a struct's field-by-field contents. They pin the implementation, and break on every refactor while proving nothing about behaviour. The exceptions are a layout that **is** the contract (§5) and a refusal whose stable code is the contract.
+- **Generate fixtures, don't freeze them.** Build fixtures at test time from the same declarations and code the product uses, with stub inputs. Hand-written copies of generated output (hashes, catalogs, hex blobs) drift and have to be edited by hand.
+- **Report the balance.** In the PR body, give the test lines added and removed, and the tests deleted or merged.
+
+## 7. Mutation check (before the PR)
 
 Before opening the PR, introduce at least **2 targeted mutants** into the code under test: flip a comparison (`<` to `<=`), drop a branch, change a `+` to `-`, remove a `!`. For each one, run the suite, confirm a test **fails**, then revert. When a mutant survives, strengthen the test until it catches it. Record the mutants and results in the PR body under a **"Mutation check"** heading.
 
-## 7. Bug fixes: fails before, passes after
+## 8. Bug fixes: fails before, passes after
 
 For a bug fix, also confirm the new test **fails against the unpatched code** and passes with the fix.
 
-## 8. Decide and record
+## 9. Decide and record
 
 **Decide** the seams, the test scale, the generators and the collaborators yourself, and **record** the decisions in the decision ledger:
 
@@ -58,9 +68,9 @@ Record which seams you chose and why, the invariant each property asserts, and a
 flotilla crew stall --reason "…"
 ```
 
-## 9. Every property can fail
+## 10. Every property can fail
 
-Confirm each property **can** fail: the mutation check in §6 shows it directly. Keep generators broad enough that the invariant is genuinely exercised, crossing boundaries and including the interesting inputs.
+Confirm each property **can** fail: the mutation check in §7 shows it directly. Keep generators broad enough that the invariant is genuinely exercised, crossing boundaries and including the interesting inputs.
 
 ## Before you open the PR
 
@@ -69,6 +79,7 @@ Confirm each property **can** fail: the mutation check in §6 shows it directly.
 - [ ] Generators are explicit and span the interesting space, with their coverage stated.
 - [ ] Edge cases (empty, boundary, duplicate, error, interleaving) are named or generated.
 - [ ] Real collaborators or fakes are used; any boundary double carries a one-line note.
+- [ ] Each behaviour is proved once: existing tests were searched, superseded tests deleted or merged, no tests restate constants, paths or message wording, and the PR gives test lines added and removed.
 - [ ] Mutation check done: at least 2 mutants, each caught, reverted, and written up in the PR body.
 - [ ] Bug fix: the test failed before the fix.
 - [ ] Decisions are recorded in the ledger.
