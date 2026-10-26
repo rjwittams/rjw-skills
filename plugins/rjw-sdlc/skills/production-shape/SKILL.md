@@ -1,21 +1,25 @@
 ---
 name: production-shape
-description: Use when designing a data path (a store, index, cache, sync, protocol, backend abstraction, or a listing a person or agent reads), when changing one on a scale-sensitive path, or when reviewing either. Chooses each design axis against the project's reference scales.
+description: Use when designing, changing or reviewing a store, index, cache, sync path or listing a person or agent reads, where it runs per item, per request or per event, or holds a collection that grows with use. Chooses each design axis against the project's reference scales, standard shapes and libraries first.
 ---
 
 # Production Shape
 
-Build the **production shape** the first time. Decide each design axis on purpose, against the real operations and the project's reference scales, and stop only when you can say why your choice beats the obvious first answer.
+Build the **production shape** the first time: the shape that holds at the project's reference scales, reached by standard means.
 
-The comparison is never build cost against build cost. It is build cost now against the full later bill: someone profiles it, cannot believe how naive it is, redoes it, and carries compatibility shims for a generation. That bill is larger, and it lands with embarrassment attached.
+**Pick the standard shape on purpose.** For each hot operation, write its cost at the ceiling. If the arithmetic shows the obvious shape is wrong (a scan where an index belongs, a round trip per item, whole-state work per event, a table shaped against its reads), fix it. That needs no profile and is not optional.
+
+**Local choices are free.** A better structure, an index, interning or packing that stays inside one module needs no special justification. Make it, and mark the assumption it relies on.
+
+**Volume needs a reason.** Writing what a library or the project's shared crates already provide, adding a new layer (a client, codec, protocol or error model), or repeating machinery per route needs a named property the existing option fails, cited from its source or documentation. When the reason is speed, a measurement.
+
+**Keep each change reviewable.** Keep production code under about 1,000 lines per PR; smaller is better. Past that, split into a stack, each part one deliverable. A change much larger than its ticket needs is a finding.
 
 **Maturity sets the ceiling.** A prototype meant to be abandoned, or a personal tool, sizes its ceiling to its real use, and the shape that fits is its production shape. When such code is promoted, its shapes expire: that is a recorded condition, not a surprise.
 
-## The profiler test
+## The cost test
 
-Picture an expert performance engineer profiling this at the project's ceiling a year from now. If they would be shocked at how naive it is, it is not the cheap option.
-
-Make it concrete rather than imagined: for the hottest operation, write its cost at the ceiling (operations times cardinality, bytes moved, round trips) and the resident size. On a per-event path, the hottest operation is one event: write its cost per change. The test passes when those numbers fit the reference deployments' budgets and the expert would find nothing large left on the table.
+For the hottest operation, write its cost at the ceiling (operations times cardinality, bytes moved, round trips) and the resident size. On a per-event path, the hottest operation is one event: write its cost per change. The test passes when those numbers fit the reference deployments' budgets.
 
 ## How much to do
 
@@ -36,7 +40,7 @@ Make it concrete rather than imagined: for the hottest operation, write its cost
    - Protocol and wire format: [PROTOCOLS.md](PROTOCOLS.md)
    - Evolution of anything that outlives a process (wire, persisted formats, schemas, public APIs): [EVOLUTION.md](EVOLUTION.md)
    - Failure at boundaries, when the work calls across a process or network boundary: [FAILURE.md](FAILURE.md)
-3. **Run the profiler test.** Done when every axis choice passes or is recorded as a smaller shape.
+3. **Run the cost test.** Done when every axis choice passes or is recorded as a smaller shape.
 4. **Record** the choices following the project's conventions (below).
 
 ## Workload note
@@ -55,7 +59,7 @@ When you cannot fill a cardinality, ask. When nobody can be asked (an autonomous
 ## Evidence
 
 - **Reasoning rejects** the first answer: the operations at the ceiling are enough.
-- **A candidate walk justifies** a choice, including a custom structure: list the properties the operations need, and reject each standard candidate by the property it fails.
+- **A candidate walk justifies** a choice. List the properties the operations need, then start with established libraries and the project's own shared crates: one that has those properties is the choice. Write your own only for a property every candidate fails, and name it.
 - **Claims about a dependency** (what it can or cannot do, what it guarantees) cite its source or documentation, not memory.
 - **Claims about numbers** ("the simple shape holds on this hot path", "fits the memory budget") take basic timing or a profile. Inspect generated code only for hot loops where timing cannot explain the result.
 - **Find resident waste by census**, not by guess. Count what a structure holds by kind: values against distinct values (the **duplication ratio**), and string-keyed maps against distinct keysets (the **shape count**), counting each shared allocation once. A counting allocator gives the total and a heap profiler the allocation sites. Where resident size is a recurring budget, keep the census as code run against a recorded real workload, so the next change reruns it.
@@ -91,7 +95,8 @@ A smaller shape that bakes its limit into a protocol, an on-disk format or a pub
 Review is static: arithmetic is the evidence.
 
 - For each data path in the change, compute the hottest operation's cost at the ceiling from the workload model. A **naive shape** is a finding when that arithmetic shows it; it needs no profile.
-- Report naive shapes separately from size findings. The production shape is often less code, so never trade one against the other in a single finding.
+- Report naive shapes and size findings separately. The production shape is usually less code.
+- A change over the size ceiling, or one that writes what a library or the project's shared crates already provide, is a finding.
 - On a scale-sensitive path, a missing workload note, or a smaller shape without an expiry and a seam, is a finding. Elsewhere it is not.
 - A change that adds a store, a dominant operation or a dependency without updating the nearest `WORKLOAD.md` is a finding.
 - A durable-store read on a per-event, per-request or per-pass path is a finding unless the workload note records why that data is not held resident.
@@ -104,4 +109,4 @@ Review is static: arithmetic is the evidence.
 
 ## Scope
 
-YAGNI decides whether a feature exists. This skill decides its shape once it does, in application code as much as in infrastructure.
+YAGNI decides whether a feature exists. This skill decides its shape once it does.

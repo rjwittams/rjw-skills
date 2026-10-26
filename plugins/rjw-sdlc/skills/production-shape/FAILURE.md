@@ -1,6 +1,6 @@
 # Failure at boundaries
 
-Decide what happens when the other side of a boundary is slow, down, absent or wrong, and translate its types and errors into your own at the boundary so nothing inside depends on its vocabulary. **Match the defence to the boundary**: each rung adds to the one above it.
+Decide what happens when the other side of a boundary is slow, down, absent or wrong, and translate its errors into your own at the boundary, one error type per crate. Use its types directly when they already say what you mean; wrap them only where they would leak a choice you expect to change. **Match the defence to the boundary**: each rung adds to the one above it.
 
 **Degraded paths are visible.** Every fallback, cached or partial answer says which path served it, in the log and in the result, so consumers and operators can tell a degraded answer from a normal one.
 

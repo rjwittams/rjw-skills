@@ -1,7 +1,7 @@
 # Workload model: code search (desktop tool)
 
 Design and review data-touching work with the `production-shape` skill: production shape,
-profiler test, naive shape, workload note, candidate walk, bounded consumer, snapshot then
+cost test, naive shape, workload note, candidate walk, bounded consumer, snapshot then
 deltas, query cover, operation lowering, single writer, steady state, match the defence to
 the boundary, evolution level.
 

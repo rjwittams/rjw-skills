@@ -1,6 +1,6 @@
 {
   "name": "rjw-sdlc",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "SDLC skills: PR shepherding, issue triage, consistency review, test design, production-shape design guidance, and related workflow automation.",
   "author": {
     "name": "Robert Wittams"
