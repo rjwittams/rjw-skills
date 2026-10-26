@@ -11,7 +11,7 @@ The levels form a spectrum, not strict categories:
 - **v. Replanned**: plan, execute 1..n steps or time units, measure error, replan or backtrack (MCTS, MPC).
 - **vi. Agentic**: an agent decides. Easy to start, highest cost and error rate. Parts lower to more predictable levels as patterns settle, to improve the system rather than to eliminate the agent.
 
-Prefer **generalization over abstraction**: a vocabulary wide enough to carry every backend's full capability, rather than a layer that passes only the common subset. Independent per-item fetches batch into one backend call (the DataLoader / Haxl shape).
+Prefer **wide abstractions over common-subset ones**: a vocabulary wide enough to carry every backend's full capability, rather than a layer that passes only what every backend shares. Independent per-item fetches batch into one backend call (the DataLoader / Haxl shape).
 
 An execution trace at any level could be written as a level i program; levels iv to vi often generate one on the fly. What justifies building higher is how much the best trace varies: with dependencies, with the data, and over time. Level iv is justified when the state of the world changes which plan is best. Level v is justified when plans can only be expected to hold locally: the search space is large and branching, or approximation error accumulates. Level i is the production shape when the set of backends is known and closed and you can choose between them well. When the set is open, the question is whether level iii costs about the same as level ii here; it often does, and it keeps the best backends uncrippled.
 
